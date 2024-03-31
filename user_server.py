@@ -137,13 +137,6 @@ def pyppo_decode_id(id):
 @app.route('/')
 def get_pyppo_dashboard():
     sp = spotipy.Spotify(auth_manager=sp_oauth)
-    
-    
-    # Must return data of track recommendation , limit 10
-    
-    # Must return data of track based on same "type"
-    
-    
     try:
         # Fetching user's playlists
         user_playlists_results = sp.current_user_playlists()
@@ -219,7 +212,7 @@ def get_pyppo_search_by_query():
 
     try:
         # Search for tracks in the database
-        database_tracks = Track.query.filter(Track.name.ilike(f'%{search_query}%')).limit(10).all()
+        database_tracks = Track.query.filter(Track.name.ilike(f'%{search_query}%')).limit(6).all()
         track_info = []
 
         # Process tracks from the database
@@ -234,9 +227,9 @@ def get_pyppo_search_by_query():
             })
             
         # Check if there are enough tracks in the database
-        if len(track_info) < 5:
+        if len(track_info) < 6:
             # Determine how many additional tracks are needed
-            remaining_tracks_count = 5 - len(track_info)
+            remaining_tracks_count = 6 - len(track_info)
 
             # Search for additional tracks using the Spotify API
             spotify_results = sp.search(q=search_query, type='track', limit=remaining_tracks_count)
@@ -523,6 +516,8 @@ def get_recent_tracks():
         Track.name,
         Track.cloudinary_img_url,
         Track.artists,
+        Track.duration_ms,
+        Track.id,
         RecentTrack.spotify_id
     ).join(
         RecentTrack.track
@@ -536,8 +531,10 @@ def get_recent_tracks():
             serialized_data.append({
                 'played_at': track_data.played_at,
                 'name': track_data.name,
-                'cloudinary_img_url': track_data.cloudinary_img_url,
+                'spotify_image_url': track_data.cloudinary_img_url,
                 'artists': track_data.artists.split(','), 
+                'duration' : track_data.duration_ms,
+                'id': track_data.id,
                 'spotify_id': track_data.spotify_id
             })
         
@@ -594,18 +591,20 @@ def pyppo_play_track():
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
     track_uri = request.json.get('trackUri')
-    device_id = request.json.get('deviceId')
+    device_id = request.json.get('myDeviceId')
 
     sp.start_playback(device_id=device_id, uris=[track_uri])
-    
+    time.sleep(1)
+
     return jsonify({'success': True, 'message': 'Playback started successfully.'}), 200
+
 
 @app.route('/playback/pause', methods=['POST'])
 def pyppo_pause_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
-    device_id = request.json.get('deviceId')
+    device_id = request.json.get('myDeviceId')
 
     sp.pause_playback(device_id=device_id)
     
@@ -616,7 +615,7 @@ def resume_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
-    device_id = request.json.get('deviceId')
+    device_id = request.json.get('myDeviceId')
 
     sp.start_playback(device_id=device_id)
     
@@ -626,7 +625,7 @@ def resume_track():
 def next_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    device_id = request.json.get('deviceId')
+    device_id = request.json.get('myDeviceId')
 
     playlists = sp.featured_playlists(limit=50)['playlists']['items']
     random_playlist = random.choice(playlists)
@@ -644,8 +643,8 @@ def next_track():
         'nextTrack': {
             'name' : current_track_info['track'].get('name'),
             'spotify_id' : current_track_info['track'].get('id'),
-            'artist' : current_track_info['track'].get('artists')[0].get('name'),
-            'spotify_img_url' : current_track_info['track'].get('album').get('images')[0].get('url'),
+            'artists' : current_track_info['track'].get('artists')[0].get('name'),
+            'spotify_image_url' : current_track_info['track'].get('album').get('images')[0].get('url'),
             'duration' : current_track_info['track'].get('duration_ms')
         }
     }
@@ -658,7 +657,7 @@ def next_track():
 def previous_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    device_id = request.json.get('deviceId')
+    device_id = request.json.get('myDeviceId')
 
     playlists = sp.featured_playlists(limit=50)['playlists']['items']
     random_playlist = random.choice(playlists)
@@ -676,8 +675,8 @@ def previous_track():
         'previousTrack': {
             'name' : current_track_info['track'].get('name'),
             'spotify_id' : current_track_info['track'].get('id'),
-            'artist' : current_track_info['track'].get('artists')[0].get('name'),
-            'spotify_img_url' : current_track_info['track'].get('album').get('images')[0].get('url'),
+            'artists' : current_track_info['track'].get('artists')[0].get('name'),
+            'spotify_image_url' : current_track_info['track'].get('album').get('images')[0].get('url'),
             'duration' : current_track_info['track'].get('duration_ms')
         }
     }
@@ -690,7 +689,7 @@ def previous_track():
 def toggle_shuffle():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    device_id = request.json.get('deviceId')
+    device_id = request.json.get('myDeviceId')
     shuffle_state = request.json.get('shuffleState')  # True to enable shuffle, False to disable
     sp.shuffle(shuffle_state, device_id=device_id)
     return jsonify({'success': True, 'message': f'Shuffle {"enabled" if shuffle_state else "disabled"} successfully.'}), 200
@@ -699,10 +698,45 @@ def toggle_shuffle():
 def toggle_repeat():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    device_id = request.json.get('deviceId')
+    device_id = request.json.get('myDeviceId')
     repeat_state = request.json.get('repeatState')  # 'track', 'context', or 'off'
     sp.repeat(repeat_state, device_id=device_id)
     return jsonify({'success': True, 'message': f'Repeat mode set to {repeat_state} successfully.'}), 200
+
+@app.route('/playback/seek', methods=['POST'])
+def seek():
+    data = request.json
+    new_position_ms = int(data.get('newPositionMs'))
+    
+    access_token = redis.get('spotify_access_token').decode('utf-8')
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+    # Get the current playback information
+    playback_info = sp.current_playback()
+
+    # Check if a track is currently playing
+    if playback_info and playback_info['is_playing']:
+        # Seek to the new position
+        sp.seek_track(new_position_ms)  
+        return jsonify({'new_position': new_position_ms})
+    else:
+        return jsonify({'message': 'No track is currently playing'})
+
+@app.route('/playback/current_track_position')    
+def spotify_current_track_position():
+    access_token = redis.get('spotify_access_token').decode('utf-8')
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
+    # Get the current playback information
+    playback_info = sp.current_playback()
+
+    # Check if a track is currently playing
+    if playback_info and playback_info['is_playing']:
+        # Get the current track position
+        current_track_position = playback_info['progress_ms']
+    else:
+        current_track_position = 0
+
+    return jsonify({'current_track_position': current_track_position})
 
 # def monitor_playback_status():
 #     access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -973,15 +1007,15 @@ def recommend_genres_by_name(genre_name):
     for track_info in tracks_info:
         formatted_track = {
             "name": track_info["name"],
-            "track_id": track_info["id"],
+            "spotify_id": track_info["id"],
             "album_id": track_info["album"]["id"],
             "artists": [artist["name"] for artist in track_info["artists"]],
-            "duration_ms": track_info["duration_ms"],
+            "duration": track_info["duration_ms"],
             "popularity": track_info["popularity"],
             "preview_url": track_info["preview_url"],
             "release_date": track_info["album"]["release_date"],
             "album_name": track_info["album"]["name"],
-            "image_url": track_info["album"]["images"][0]["url"]  # Assuming the first image is the main one
+            "spotify_image_url": track_info["album"]["images"][0]["url"]  # Assuming the first image is the main one
         }
         formatted_tracks.append(formatted_track)
 
@@ -1001,7 +1035,7 @@ async def recommend_artists_by_genre(genre):
                 "name": artist_info["name"],
                 "artist_id": artist_info["id"],
                 "popularity": artist_info["popularity"],
-                "image_url": artist_info["images"][0]["url"] if artist_info["images"] else None
+                "spotify_image_url": artist_info["images"][0]["url"] if artist_info["images"] else None
             }
             formatted_artists.append(formatted_artist)
         sorted_artists = sorted(formatted_artists, key=lambda x: x['popularity'], reverse=True)[:6]
@@ -1009,7 +1043,7 @@ async def recommend_artists_by_genre(genre):
     except spotipy.SpotifyException as e:
         return jsonify({'error': str(e)})
     
-@app.route('/recommendation/tracks/<path:genre>')
+@app.route('/recommendation/tracks/<path:genre>')   
 def recommend_tracks_by_genre(genre):
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -1025,11 +1059,12 @@ def recommend_tracks_by_genre(genre):
             album_images = album_info['images']
             album_image_url = album_images[0]['url'] if album_images else None  # Get the first image URL if available
             formatted_track = {
-                "track_name": track_info["name"],
+                "name": track_info["name"],
                 "artists": artists,
-                "track_id": track_info["id"],
+                "duration" : track_info["duration_ms"],
+                "spotify_id": track_info["id"],
                 "popularity": track_info["popularity"],
-                "image_url": album_image_url  # Use album image as a representation of the track
+                "spotify_image_url": album_image_url  # Use album image as a representation of the track
             }
             formatted_tracks.append(formatted_track)
         sorted_tracks = sorted(formatted_tracks, key=lambda x: x['popularity'], reverse=True)[:6]
