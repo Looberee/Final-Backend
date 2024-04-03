@@ -3,10 +3,18 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
-from flask_jwt_extended import create_access_token, JWTManager, jwt_required, get_jwt_identity, unset_jwt_cookies, create_refresh_token
+from flask_jwt_extended import create_access_token, JWTManager, jwt_required, get_jwt_identity, unset_jwt_cookies, create_refresh_token, set_access_cookies, set_refresh_cookies, verify_jwt_in_request
 from flask_session import Session
-import random
+from flask_caching import Cache
+from flask_socketio import SocketIO, emit
 
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+
+import random
+from retrying import retry
+import atexit
 
 # End importing Flask Components
 
@@ -31,6 +39,7 @@ import asyncio
 import aiohttp
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 import spotipy
 from spotipy import Spotify
@@ -59,27 +68,37 @@ import json
 from threading import Thread
 
 
+
 app = Flask(__name__, instance_relative_config=True)
+
 app.secret_key = 'Delta1006'
 
 
 login_manager = LoginManager(app)
 login_manager.init_app(app)
 
-CORS(app, origins=["http://localhost:3000"])  # Replace with your frontend URL
+CORS(app, origins=["http://localhost:3000"], supports_credentials=True)  # Replace with your frontend URL
+socketio = SocketIO(app, cors_allowed_origins="*")
 redis = FlaskRedis(app)
-jwt = JWTManager(app)
-jwt.init_app(app)
+cache = Cache(app, config={'CACHE_TYPE': 'simple'})
+
 
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:Delta1006@127.0.0.1/pyppo'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['CORS_ENABLED'] = True
 app.config['JWT_SECRET_KEY'] = app.secret_key
 app.config['SECRET_KEY'] = app.secret_key
 app.config['SESSION_TYPE'] = 'filesystem'
 app.config['SESSION_PERMANENT'] = False  # Ensure session is not permanent
 app.config['REDIS_URL'] = "redis://:Delta1006@localhost:6379/0"
+app.config['JWT_TOKEN_LOCATION'] = ['cookies']
+app.config['JWT_COOKIE_SECURE'] = True
+app.config['JWT_COOKIE_SAMESITE'] = 'None'
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['JWT_COOKIE_CSRF_PROTECT'] = False
 # End configuring SQLAlchemy Database
-
+jwt = JWTManager(app)
+jwt.init_app(app)
 
 db.init_app(app)
 migrate = Migrate(app, db)
@@ -134,48 +153,72 @@ def pyppo_decode_id(id):
     return int(base64.b64decode(id).decode())
 
 #All endpoints must return a jsonify data
+def fetch_playlist_tracks(sp, playlist_id):
+    playlist = sp.playlist(playlist_id)
+    tracks = playlist["tracks"]["items"]
+    return random.sample(tracks, 6)
+
+def format_tracks(tracks):
+    return [{
+        'id': i + 1,
+        'spotify_id': track['track']['id'],
+        'name': track['track']['name'],
+        'artists': [artist['name'] for artist in track['track']['artists']],
+        'duration': track['track']['duration_ms'],
+        'spotify_image_url': track['track']['album']['images'][0]['url']
+    } for i, track in enumerate(tracks)]
+
 @app.route('/')
 def get_pyppo_dashboard():
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-    try:
-        # Fetching user's playlists
-        user_playlists_results = sp.current_user_playlists()
-        
-        something = sp.search(q='jkve', limit=20)
-        
-        user_playlists = user_playlists_results.get('items', [])
+    access_token = redis.get('spotify_access_token').decode('utf-8')
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+    
+    tracks = Track.query.with_entities(Track.id, Track.spotify_id, Track.name, Track.artists).order_by(Track.popularity.desc()).limit(6).all()
+    tracks = [track._asdict() for track in tracks] 
 
-        # Extract relevant information from each playlist
-        playlists_info = []
-        for playlist in user_playlists:
-            playlist_info = {
-                'name': playlist.get('name', 'Unknown Playlist'),
-                'uri': playlist.get('uri', ''),
-                'tracks': []
-            }
+    # Define playlist IDs
+    playlist_ids = ['6DZ46o6pDDIbqXzK5PN3qJ', '37i9dQZF1EVHGWrwldPRtj', '37i9dQZF1EQp9BVPsNVof1']
 
-            # Fetch tracks within the playlist
-            playlist_tracks_results = sp.playlist_tracks(playlist['id'], limit=10)
-            playlist_tracks = playlist_tracks_results.get('items', [])
+    # Fetch playlist tracks concurrently
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        playlists = executor.map(lambda playlist_id: fetch_playlist_tracks(sp, playlist_id), playlist_ids)
 
-            # Extract relevant information from each track in the playlist
-            for track in playlist_tracks:
-                track_info = {
-                    'name': track.get('track', {}).get('name', 'Unknown Track'),
-                    'artist': track.get('track', {}).get('artists', [{}])[0].get('name', 'Unknown Artist'),
-                    'uri': track.get('track', {}).get('uri', '')
-                }
-                playlist_info['tracks'].append(track_info)
+    # Format tracks
+    formatted_tracks = [format_tracks(tracks) for tracks in playlists]
 
-            playlists_info.append(playlist_info)
-            
-            playlist_info = list(set(playlists_info))
+    # Fetch EDM artists
+    edm_artists = sp.search(q='genre:edm', type='artist', limit=6)['artists']['items']
 
-        return jsonify({'user_playlists': playlists_info, 'search' : something})
+    # Format EDM artists
+    formatted_edm_artists = [{
+        "id": i + 1,
+        "name": edm_artist["name"],
+        "artist_id": edm_artist["id"],
+        "popularity": edm_artist["popularity"],
+        "spotify_image_url": edm_artist["images"][0]["url"] if edm_artist["images"] else None
+    } for i, edm_artist in enumerate(edm_artists)]
+    
 
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
+    return jsonify({
+        'tracks' : tracks,
+        'ncs_tracks': formatted_tracks[0],
+        'relax_tracks': formatted_tracks[1],
+        'electronic_tracks': formatted_tracks[2],
+        'edm_artists': formatted_edm_artists
+    })
 
+
+@app.route('/cookies')
+def get_cookies():
+    cookies = request.cookies
+
+    # Print the contents of each cookie
+    for cookie_name, cookie_value in cookies.items():
+        print("--------------------")
+        print(f"Cookie '{cookie_name}': {cookie_value}")
+        print("--------------------")
+
+    return "Check your console for cookie information!"
 
 # ----------- TRACKS --------------- #
 @app.route('/tracks/<path:track_id>')
@@ -586,20 +629,49 @@ def get_active_devices():
     return jsonify({'devices': active_devices})
 
 @app.route('/playback/play', methods=['POST'])
+@jwt_required()
 def pyppo_play_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
     track_uri = request.json.get('trackUri')
     device_id = request.json.get('myDeviceId')
+    
+    track_info = sp.track(track_uri)
+    track_name = track_info['name']
 
-    sp.start_playback(device_id=device_id, uris=[track_uri])
-    time.sleep(1)
+    @retry(stop_max_attempt_number=3, wait_fixed=1000)
+    def start_playback():
+        sp.start_playback(device_id=device_id, uris=[track_uri])
 
-    return jsonify({'success': True, 'message': 'Playback started successfully.'}), 200
+    try:
+        start_playback()
+        time.sleep(1)
+        return jsonify({'success': True, 'message': 'Playback started successfully.'}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'message': 'Failed to start playback: ' + str(e)}), 500
 
+
+# @socketio.on('playTrack')
+# def pyppo_play_track_socketio(data):
+#     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
+#     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
+#     track_uri = data['trackUri']
+#     device_id = data['myDeviceId']
+
+#     @retry(stop_max_attempt_number=3, wait_fixed=1000)
+#     def start_playback():
+#         sp.start_playback(device_id=device_id, uris=[track_uri])
+
+#     try:
+#         start_playback()
+#         emit('trackStarted', {'current_track': track_uri})
+#     except Exception as e:
+#         print('Failed to start playback: ' + str(e))
 
 @app.route('/playback/pause', methods=['POST'])
+@jwt_required()
 def pyppo_pause_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -611,6 +683,7 @@ def pyppo_pause_track():
     return jsonify({'success': True, 'message': 'Playback paused successfully.'}), 200
 
 @app.route('/playback/resume', methods=['POST'])
+@jwt_required()
 def resume_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -622,12 +695,13 @@ def resume_track():
     return jsonify({'success': True, 'message': 'Playback resumed successfully.'}), 200
 
 @app.route('/playback/next', methods=['POST'])
+@jwt_required()
 def next_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
     device_id = request.json.get('myDeviceId')
 
-    playlists = sp.featured_playlists(limit=50)['playlists']['items']
+    playlists = sp.featured_playlists(limit=7)['playlists']['items']
     random_playlist = random.choice(playlists)
     playlist_id = random_playlist['id']
     results = sp.playlist_tracks(playlist_id)
@@ -643,7 +717,7 @@ def next_track():
         'nextTrack': {
             'name' : current_track_info['track'].get('name'),
             'spotify_id' : current_track_info['track'].get('id'),
-            'artists' : current_track_info['track'].get('artists')[0].get('name'),
+            'artists' : [artist['name'] for artist in current_track_info['track'].get('artists')],
             'spotify_image_url' : current_track_info['track'].get('album').get('images')[0].get('url'),
             'duration' : current_track_info['track'].get('duration_ms')
         }
@@ -654,12 +728,13 @@ def next_track():
     return jsonify(response_data), 200
 
 @app.route('/playback/previous', methods=['POST'])
+@jwt_required()
 def previous_track():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
     device_id = request.json.get('myDeviceId')
 
-    playlists = sp.featured_playlists(limit=50)['playlists']['items']
+    playlists = sp.featured_playlists(limit=7)['playlists']['items']
     random_playlist = random.choice(playlists)
     playlist_id = random_playlist['id']
     results = sp.playlist_tracks(playlist_id)
@@ -675,7 +750,7 @@ def previous_track():
         'previousTrack': {
             'name' : current_track_info['track'].get('name'),
             'spotify_id' : current_track_info['track'].get('id'),
-            'artists' : current_track_info['track'].get('artists')[0].get('name'),
+            'artists' : [artist['name'] for artist in current_track_info['track'].get('artists')],
             'spotify_image_url' : current_track_info['track'].get('album').get('images')[0].get('url'),
             'duration' : current_track_info['track'].get('duration_ms')
         }
@@ -686,6 +761,7 @@ def previous_track():
     return jsonify(response_data), 200
 
 @app.route('/playback/shuffle', methods=['POST'])
+@jwt_required()
 def toggle_shuffle():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -695,6 +771,7 @@ def toggle_shuffle():
     return jsonify({'success': True, 'message': f'Shuffle {"enabled" if shuffle_state else "disabled"} successfully.'}), 200
 
 @app.route('/playback/repeat', methods=['POST'])
+@jwt_required()
 def toggle_repeat():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -704,6 +781,7 @@ def toggle_repeat():
     return jsonify({'success': True, 'message': f'Repeat mode set to {repeat_state} successfully.'}), 200
 
 @app.route('/playback/seek', methods=['POST'])
+@jwt_required()
 def seek():
     data = request.json
     new_position_ms = int(data.get('newPositionMs'))
@@ -722,6 +800,7 @@ def seek():
         return jsonify({'message': 'No track is currently playing'})
 
 @app.route('/playback/current_track_position')    
+@jwt_required()
 def spotify_current_track_position():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -737,6 +816,80 @@ def spotify_current_track_position():
         current_track_position = 0
 
     return jsonify({'current_track_position': current_track_position})
+
+
+# -------------------------- ROOM ----------------------------
+@socketio.on('test')
+def handle_my_event(data):
+    print("------------------------")
+    print('received data: ' + data.get('message'))
+    print("------------------------")
+
+@socketio.on('join_room')
+def join_room(data):
+    room_id = data.get('room_id')
+    username = data.get('username')
+    join_room(room_id)
+    emit('user_joined', {'username': username, 'room_id': room_id}, room=room_id)
+
+@socketio.on('create_room')
+def create_room(data):
+    room_id = generate_room_id(5)  # Implement your own logic to generate a unique room ID
+    username = data.get('username')
+    join_room(room_id)
+    emit('room_created', {'room_id': room_id}, room=room_id)
+    emit('user_joined', {'username': username, 'room_id': room_id}, room=room_id)
+
+@socketio.on('invite_people')
+def invite_people(data):
+    room_id = data.get('room_id')
+    invited_users = data.get('invited_users')
+    emit('invitation_sent', {'room_id': room_id, 'invited_users': invited_users}, room=room_id)
+
+@socketio.on('send_message')
+def send_message(data):
+    room_id = data.get('room_id')
+    message = data.get('message')
+    username = data.get('username')
+    emit('receive_message', {'message': message, 'username': username}, room=room_id)
+    
+@socketio.on('room/playback/play')
+def on_play(data):
+    room_id = data.get('room_id')
+    track_uri = data.get('track_uri')
+    device_id = data.get('device_id')
+    emit('room/playback/play', {'track_uri': track_uri, 'device_id': device_id}, room=room_id)
+
+@socketio.on('room/playback/pause')
+def on_pause(data):
+    room_id = data.get('room_id')
+    device_id = data.get('device_id')
+    emit('room/playback/pause', {'device_id': device_id}, room=room_id)
+    
+@socketio.on('room/playback/next')
+def on_next(data):
+    room_id = data.get('room_id')
+    device_id = data.get('device_id')
+    emit('room/playback/next', {'device_id': device_id}, room=room_id)
+    
+@socketio.on('room/playback/previous')
+def on_previous(data):
+    room_id = data.get('room_id')
+    device_id = data.get('device_id')
+    emit('room/playback/previous', {'device_id': device_id}, room=room_id)
+    
+@socketio.on('room/playback/seek')
+def on_seek(data):
+    room_id = data.get('room_id')
+    new_position_ms = data.get('new_position_ms')
+    device_id = data.get('device_id')
+    emit('room/playback/seek', {'new_position_ms': new_position_ms, 'device_id': device_id}, room=room_id)
+
+@socketio.on('room/playback/resume')
+def on_resume(data):
+    room_id = data.get('room_id')
+    device_id = data.get('device_id')
+    emit('room/playback/resume', {'device_id': device_id}, room=room_id)
 
 # def monitor_playback_status():
 #     access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -761,181 +914,18 @@ def spotify_current_track_position():
 # monitor_thread.daemon = True
 # monitor_thread.start()
 
-@app.route('/playlists/<path:playlist_id>')
-def get_pyppo_playlists_by_id(playlist_id):
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-    
-    try:
-        # Get playlist information using the Spotify API
-        playlist_info = sp.playlist(playlist_id)
-
-        # Extract relevant information from the playlist_info dictionary
-        playlist_response = {
-            'name': playlist_info['name'],
-            'owner': playlist_info['owner']['display_name'],
-            'uri': playlist_info['uri'],
-            'image_url': playlist_info['images'][0]['url'] if 'images' in playlist_info else None,
-            'tracks': []
-        }
-
-        # Fetch detailed information for each track in the playlist
-        for track in playlist_info['tracks']['items']:
-            track_info = track['track']
-            playlist_response['tracks'].append({
-                'name': track_info['name'],
-                'uri': track_info['uri'],
-                'duration_ms': track_info['duration_ms'],
-                'preview_url': track_info['preview_url'],
-                'artists': [{'name': artist['name'], 'uri': artist['uri']} for artist in track_info['artists']],
-                'album': {'name': track_info['album']['name'], 'uri': track_info['album']['uri']}
-            })
-
-        return jsonify(playlist_response)
-
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
-    
-# --------------------------- ARTISTS --------------------------- #
-@app.route('/artists/<path:artist_id>')
-def get_pyppo_artists_id(artist_id):
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-    
-    try:
-        # Get artist information using the Spotify API
-        artist_info = sp.artist(artist_id)
-
-        # Extract relevant information from the artist_info dictionary
-        artist_response = {
-            'name': artist_info['name'],
-            'uri': artist_info['uri'],
-            'followers': artist_info['followers']['total'],
-            'genres': artist_info['genres'],
-            'image_url': artist_info['images'][0]['url'] if 'images' in artist_info else None,
-            'popularity': artist_info['popularity']
-        }
-
-        return jsonify(artist_response)
-
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
-    
-@app.route('/artists/<path:artist_id>/top-tracks')
-def get_pyppo_top_tracks_of_artist(artist_id):
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-
-    try:
-        # Get top tracks of the artist using the Spotify API
-        top_tracks = sp.artist_top_tracks(artist_id, country='US')  # You can specify the country code as needed
-
-        # Extract relevant information from the top_tracks dictionary
-        tracks_response = []
-        for track in top_tracks['tracks']:
-            track_response = {
-                'name': track['name'],
-                'uri': track['uri'],
-                'duration_ms': track['duration_ms'],
-                'preview_url': track['preview_url'],
-                'artists': [{'name': artist['name'], 'uri': artist['uri']} for artist in track['artists']],
-                'album': {'name': track['album']['name'], 'uri': track['album']['uri']},
-                'popularity': track['popularity']
-            }
-            tracks_response.append(track_response)
-
-        return jsonify({'top_tracks': tracks_response})
-
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
-    
-@app.route('/artists/<path:artist_id>/related-artists')
-def get_related_artists(artist_id):
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-
-    try:
-        # Get related artists using the Spotify API
-        related_artists = sp.artist_related_artists(artist_id)
-
-        # Extract relevant information from the related_artists dictionary
-        artists_response = []
-        for related_artist in related_artists['artists']:
-            artist_response = {
-                'name': related_artist['name'],
-                'uri': related_artist['uri'],
-                'genres': related_artist['genres'],
-                'image_url': related_artist['images'][0]['url'] if 'images' in related_artist else None,
-                'popularity': related_artist['popularity']
-            }
-            artists_response.append(artist_response)
-
-        return jsonify({'related_artists': artists_response})
-
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
-
-# -------------------------------- ALBUMS -------------------------------- # 
-@app.route('/albums/<path:album_id>')
-def get_pyppo_album_by_id(album_id):
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-
-    try:
-        # Get album information using the Spotify API
-        album_info = sp.album(album_id)
-
-        # Extract relevant information from the album_info dictionary
-        response = {
-            'name': album_info['name'],
-            'artist': album_info['artists'][0]['name'],
-            'release_date': album_info['release_date'],
-            'uri': album_info['uri'],
-            'image_url': album_info['images'][0]['url'] if 'images' in album_info else None,
-            'tracks': [{'name': track['name'],
-                        'uri': track['uri'],
-                        'id' : track['id'],
-                        'image_url': sp.track(track['id'])['album']['images'][0]['url'] if 'images' in sp.track(track['id'])['album'] else None} for track in album_info['tracks']['items']]
-        }
-
-        return jsonify(response)
-
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
-    
-@app.route('/albums/<path:album_id>/tracks')
-def get_pyppo_albums_tracks(album_id): 
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-    
-    try:
-        # Get album information using the Spotify API
-        album_info = sp.album(album_id)
-
-        # Extract relevant information from the album_info dictionary
-        album_response = {
-            'name': album_info['name'],
-            'artist': album_info['artists'][0]['name'],
-            'release_date': album_info['release_date'],
-            'uri': album_info['uri'],
-            'image_url': album_info['images'][0]['url'] if 'images' in album_info else None,
-            'tracks': []
-        }
-
-        # Fetch detailed information for each track in the album
-        for track in album_info['tracks']['items']:
-            track_info = sp.track(track['id'])
-            album_response['tracks'].append({
-                'name': track_info['name'],
-                'uri': track_info['uri'],
-                'duration_ms': track_info['duration_ms'],
-                'preview_url': track_info['preview_url'],
-                'artists': [{'name': artist['name'], 'uri': artist['uri']} for artist in track_info['artists']],
-                'album': {'name': track_info['album']['name'], 'uri': track_info['album']['uri']}
-            })
-
-        return jsonify(album_response)
-
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
-
-
 
 # -------------------------------- GENRES --------------------------------#
+@app.route('/genres')
+def get_genres():
+    access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+    
+    genres = sp.recommendation_genre_seeds();
+    
+    return jsonify({'genres': genres})
+
+
 def map_genres_to_cloudinary():
     access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -994,22 +984,15 @@ def recommend_genres():
     genres_list = [{'id': genre.id, 'genre_name': genre.genre_name, 'genre_image': genre.cloudinary_image_url} for genre in genres]
     return jsonify({'genres': genres_list})
 
-
-@app.route('/recommendation/genres/<path:genre_name>')
-def recommend_genres_by_name(genre_name):
-    access_token = redis.get('spotify_access_token').decode('utf-8') 
-    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    
-    formatted_tracks = []
-
-    # Get tracks for the specified genre
+def fetch_tracks_by_genre(sp, genre_name):
     tracks_info = sp.recommendations(seed_genres=[genre_name], limit=30)['tracks']
+    formatted_tracks = []
     for track_info in tracks_info:
         formatted_track = {
             "name": track_info["name"],
             "spotify_id": track_info["id"],
             "album_id": track_info["album"]["id"],
-            "artists": [artist["name"] for artist in track_info["artists"]],
+            "artists": ', '.join([artist["name"] for artist in track_info["artists"]]),
             "duration": track_info["duration_ms"],
             "popularity": track_info["popularity"],
             "preview_url": track_info["preview_url"],
@@ -1018,56 +1001,94 @@ def recommend_genres_by_name(genre_name):
             "spotify_image_url": track_info["album"]["images"][0]["url"]  # Assuming the first image is the main one
         }
         formatted_tracks.append(formatted_track)
+    return formatted_tracks
 
-    return jsonify({'formatted_tracks': formatted_tracks})
+@app.route('/recommendation/genres/<path:genre_name>')
+def recommend_genres_by_name(genre_name):
+    access_token = redis.get('spotify_access_token').decode('utf-8') 
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            formatted_tracks = executor.submit(fetch_tracks_by_genre, sp, genre_name).result()
+        return jsonify({'formatted_tracks': formatted_tracks})
+    except spotipy.SpotifyException as e:
+        return jsonify({'error': str(e)})
+
+def fetch_artists_by_genre(sp, genre):
+    artists_info = sp.search(q=f'genre:"{genre}"', type='artist', limit=20)['artists']['items']
+    formatted_artists = []
+    for artist_info in artists_info:
+        formatted_artist = {
+            "name": artist_info["name"],
+            "artist_id": artist_info["id"],
+            "popularity": artist_info["popularity"],
+            "spotify_image_url": artist_info["images"][0]["url"] if artist_info["images"] else None
+        }
+        formatted_artists.append(formatted_artist)
+    sorted_artists = sorted(formatted_artists, key=lambda x: x['popularity'], reverse=True)[:6]
+    return sorted_artists
 
 @app.route('/recommendation/artists/<genre>')
-async def recommend_artists_by_genre(genre):
+@cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
+def recommend_artists_by_genre(genre):
     access_token = redis.get('spotify_access_token').decode('utf-8')
-    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    
+    sp = spotipy.Spotify(auth_manager=sp_oauth ,auth=access_token)
+
     try:
-        # Get artists for the specified genre
-        artists_info = sp.search(q=f'genre:"{genre}"', type='artist', limit=20)['artists']['items']
-        formatted_artists = []
-        for artist_info in artists_info:
-            formatted_artist = {
-                "name": artist_info["name"],
-                "artist_id": artist_info["id"],
-                "popularity": artist_info["popularity"],
-                "spotify_image_url": artist_info["images"][0]["url"] if artist_info["images"] else None
-            }
-            formatted_artists.append(formatted_artist)
-        sorted_artists = sorted(formatted_artists, key=lambda x: x['popularity'], reverse=True)[:6]
-        return jsonify({'sorted_artists': sorted_artists})  # Corrected line
+        sorted_artists = fetch_artists_by_genre(sp, genre)
+        return jsonify({'sorted_artists': sorted_artists})
     except spotipy.SpotifyException as e:
         return jsonify({'error': str(e)})
     
-@app.route('/recommendation/tracks/<path:genre>')   
+# @app.route('/recommendation/artists/<genre>')
+# def recommend_artists_by_genre(genre):
+#     genre_str = str(genre)  # Convert genre to string
+#     cached_result = redis.get(genre_str)
+#     if cached_result:
+#         return cached_result.decode('utf-8')  # Decode the cached result
+    
+#     access_token = redis.get('spotify_access_token').decode('utf-8')
+#     sp = spotipy.Spotify(auth_manager=sp_oauth)
+
+#     try:
+#         sorted_artists = fetch_artists_by_genre(sp, genre_str)
+#         # Store the Python dictionary directly without JSON serialization
+#         redis.set(genre_str, str({'sorted_artists': sorted_artists}))
+#         return jsonify({'sorted_artists': sorted_artists})
+#     except spotipy.SpotifyException as e:
+#         return jsonify({'error': str(e)})
+    
+def fetch_tracks_by_specific_genre(sp, genre):
+    results = sp.search(q=f'genre:"{genre}"', type='track', limit=12)
+    tracks_info = results['tracks']['items']
+    formatted_tracks = []
+    for track_info in tracks_info:
+        artists = ", ".join([artist['name'] for artist in track_info['artists']])
+        album_info = track_info['album']
+        album_images = album_info['images']
+        album_image_url = album_images[0]['url'] if album_images else None
+        formatted_track = {
+            "name": track_info["name"],
+            "artists": artists,
+            "duration": track_info["duration_ms"],
+            "spotify_id": track_info["id"],
+            "popularity": track_info["popularity"],
+            "spotify_image_url": album_image_url
+        }
+        formatted_tracks.append(formatted_track)
+    sorted_tracks = sorted(formatted_tracks, key=lambda x: x['popularity'], reverse=True)[:6]
+    return sorted_tracks
+
+@app.route('/recommendation/tracks/<path:genre>')
+@cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
 def recommend_tracks_by_genre(genre):
     access_token = redis.get('spotify_access_token').decode('utf-8')
-    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    
+    sp = spotipy.Spotify(auth_manager= sp_oauth, auth=access_token)
+
     try:
-        # Get tracks for the specified genre
-        results = sp.search(q=f'genre:"{genre}"', type='track', limit=12)
-        tracks_info = results['tracks']['items']
-        formatted_tracks = []
-        for track_info in tracks_info:
-            artists = ", ".join([artist['name'] for artist in track_info['artists']])
-            album_info = track_info['album']
-            album_images = album_info['images']
-            album_image_url = album_images[0]['url'] if album_images else None  # Get the first image URL if available
-            formatted_track = {
-                "name": track_info["name"],
-                "artists": artists,
-                "duration" : track_info["duration_ms"],
-                "spotify_id": track_info["id"],
-                "popularity": track_info["popularity"],
-                "spotify_image_url": album_image_url  # Use album image as a representation of the track
-            }
-            formatted_tracks.append(formatted_track)
-        sorted_tracks = sorted(formatted_tracks, key=lambda x: x['popularity'], reverse=True)[:6]
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            sorted_tracks = executor.submit(fetch_tracks_by_specific_genre, sp, genre).result()
         return jsonify({'sorted_tracks': sorted_tracks})
     except spotipy.SpotifyException as e:
         return jsonify({'error': str(e)})
@@ -1146,7 +1167,6 @@ def spotify_authorization():
 
 spotify_authorization()
 
-
 def get_access_token(code):    
     if not code:
         return jsonify({'error': 'Authorization code is missing'}), 400
@@ -1188,39 +1208,42 @@ def get_access_token(code):
 # ----------------------- LOGIN - REGISTER ------------------------ #
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.json
-    username = data.get('username')
-    password = data.get('password')
+    username = request.json.get('username')
+    password = request.json.get('password')
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
 
-    # Query the database for the user
     user = User.query.filter_by(username=username).first()
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({'message': 'Invalid username or password'}), 401
-    
-    
-    access_token = create_access_token(identity=user.id)
-    
-    spotify_access_token_bytes = redis.get('spotify_access_token') or b''
-    spotify_access_token = spotify_access_token_bytes.decode('utf-8')
-    
-    refresh_token = create_refresh_token(identity=user.id)
-    insert_refresh_token(refresh_token, user.id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
 
-    profile_data = {
-        'user_id': user.id,
+    if not check_password_hash(user.password_hash, password):
+        return jsonify({'error': 'Invalid password'}), 400
+
+    access_token = create_access_token(identity=user.id)
+    refresh_token = create_refresh_token(identity=user.id)
+    
+    profile = {
         'username': user.username,
         'email': user.email,
-        'role': user.role,  
+        'role': user.role
     }
-    resp = make_response(jsonify({
-        'message': 'Login successful',
-        'profile': profile_data,
-        'access_token': access_token,
-        'spotify_access_token': spotify_access_token  # Include Spotify access token
-    }))
-    resp.set_cookie('access_token_cookie', value=access_token, httponly=True)
-    
-    return resp, 200
+
+    response = jsonify({'profile': profile, 'login': True, 'access_token' : access_token, 'refresh_token' : refresh_token, 'spotify_token' : redis.get('spotify_access_token').decode('utf-8')})
+    set_access_cookies(response, access_token)
+    set_refresh_cookies(response, refresh_token)
+    return response, 200
+
+@app.route('/check-auth', methods=['GET'])
+def check_auth():
+    try:
+        verify_jwt_in_request()
+        return jsonify({'isAuthenticated': True}), 200
+    except:
+        print("--------------------------------")
+        print("Something wrong here!")
+        print("--------------------------------")
+        return jsonify({'isAuthenticated': False}), 401
 
 
 @app.route('/register', methods=['POST'])
@@ -1244,47 +1267,55 @@ def register():
     return jsonify({'message': 'Registration successful'}), 201
 
 @app.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True)
 def refresh():
-    refresh_spotify_token()
-    return jsonify({'message': 'Access token refreshed successfully'}), 200
+    identity = get_jwt_identity()
+    access_token = create_access_token(identity=identity)
+    response = jsonify({'refresh': True, 'access_token' : access_token})
+    set_access_cookies(response, access_token)
+    return response, 200
 
 def refresh_spotify_token():
     
-    if int(time.time()) < int(redis.get('expires_at') or 0):
-        print("Token is still valid!")
-    else:
-        refresh_token = redis.get('spotify_refresh_token').decode('utf-8')
-        if not refresh_token:
-            return jsonify({'error': 'Refresh token is missing'}), 400
+    refresh_token = redis.get('spotify_refresh_token').decode('utf-8')
+    if not refresh_token:
+        return jsonify({'error': 'Refresh token is missing'}), 400
 
-        # Your Spotify app's client ID and client secret
-        client_id = sp_oauth.client_id  # Replace with your client ID
-        client_secret = sp_oauth.client_secret  # Replace with your client secret
+    # Your Spotify app's client ID and client secret
+    client_id = sp_oauth.client_id  # Replace with your client ID
+    client_secret = sp_oauth.client_secret  # Replace with your client secret
 
-        # Prepare the headers
-        credentials = f'{client_id}:{client_secret}'
-        encoded_credentials = b64encode(credentials.encode('utf-8')).decode('utf-8')
-        headers = {
-            'Authorization': f'Basic {encoded_credentials}',
-            'Content-Type': 'application/x-www-form-urlencoded'
-        }
+    # Prepare the headers
+    credentials = f'{client_id}:{client_secret}'
+    encoded_credentials = b64encode(credentials.encode('utf-8')).decode('utf-8')
+    headers = {
+        'Authorization': f'Basic {encoded_credentials}',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
 
-        body = {
-            'grant_type': 'refresh_token',
-            'refresh_token': refresh_token
-        }
+    body = {
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token
+    }
 
-        # Make a POST request to the Spotify API
-        response = requests.post('https://accounts.spotify.com/api/token', headers=headers, data=body)
-        response.raise_for_status()  # Raise an exception if the request failed
+    # Make a POST request to the Spotify API
+    response = requests.post('https://accounts.spotify.com/api/token', headers=headers, data=body)
+    response.raise_for_status()  # Raise an exception if the request failed
 
-        # Store the new access token and its expiration time in Redis
-        token_info = response.json()
-        redis.set('spotify_access_token', token_info['access_token'])
-        expires_at = int(time.time()) + token_info['expires_in']
-        redis.set('expires_at', expires_at)
+    # Store the new access token and its expiration time in Redis
+    token_info = response.json()
+    redis.set('spotify_access_token', token_info['access_token'])
+    expires_at = int(time.time()) + token_info['expires_in']
+    redis.set('expires_at', expires_at)
 
-        print("Token has been refreshed")
+    socketio.emit('spotify_token_refreshed', {'spotify_access_token': token_info['access_token']})
+
+    print("Token has been refreshed")
+        
+def check_token():
+    if int(time.time()) > int(redis.get('expires_at') or 0) - 300:
+        refresh_spotify_token()
+        print("Token will expire in 5 minutes, force refresh now")
     
 
 # Route for refreshing Spotify token
@@ -1305,7 +1336,7 @@ def get_user_profile():
         'email': user.email,
         'role' : user.role,
     }
-    return jsonify(profile_data), 200
+    return jsonify({"profile" : profile_data}), 200
 
 
 @app.route('/logout')
@@ -1337,9 +1368,15 @@ def upload_genres_image_to_cloudinary(image_url, genre_key):
 
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(refresh_spotify_token, 'interval', minutes=1)
 scheduler.start()
+scheduler.add_job(
+    func=check_token,
+    trigger=IntervalTrigger(seconds=15),  # Check the token every minute
+    id='check_token_job',
+    name='Check if the Spotify token needs to be refreshed',
+    replace_existing=True)
+atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
     spotify_authorization()
-    app.run(debug=True)
+    socketio.run(app, debug=True, port=5000)

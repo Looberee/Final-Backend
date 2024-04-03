@@ -49,6 +49,16 @@ class Track(db.Model):
         self.encode_id = self.encode_p_id()
         self.track_genres = track_genres
         logger.info(f"Encoded ID generated for Track '{self.name}': {self.encode_id}")
+        
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'artists': self.artists,
+            'spotify_image_url' : self.cloudinary_img_url,
+            'spotify_id' : self.spotify_id,
+            'duration' : self.duration_ms
+        }
 
 @listens_for(Track, 'after_insert')
 def generate_encoded_id(mapper, connection, target):
