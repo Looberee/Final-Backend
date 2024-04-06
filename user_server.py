@@ -3,7 +3,7 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
-from flask_jwt_extended import create_access_token, JWTManager, jwt_required, get_jwt_identity, unset_jwt_cookies, create_refresh_token, set_access_cookies, set_refresh_cookies, verify_jwt_in_request
+from flask_jwt_extended import create_access_token, JWTManager, jwt_required, get_jwt_identity, unset_jwt_cookies, create_refresh_token, set_access_cookies, set_refresh_cookies, verify_jwt_in_request, get_jti, decode_token, get_jwt
 from flask_session import Session
 from flask_caching import Cache
 from flask_socketio import SocketIO, emit
@@ -296,7 +296,7 @@ def get_pyppo_search_by_query():
         # Handle Spotify API errors
         return jsonify({'error': str(e)}), 500
 
-# ------------------------ PERSONAL PLAYLISTS -------------------------- #
+# ------------------------ PERSONAL -------------------------- #
 @app.route('/personal/playlists', methods=['GET'])
 @jwt_required()
 def get_all_pyppo_user_playlists():
@@ -585,6 +585,112 @@ def get_recent_tracks():
     else:
         return jsonify({'message': 'No recent tracks found'}), 404
     
+@app.route('/personal/favourites/track', methods=['POST'])
+@jwt_required()
+def personal_favourites_tracks():
+    try:
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+        
+        current_user_id = get_jwt_identity()
+        user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+
+        if not user_pref:
+            user_pref = UserPreference(user_id=current_user_id)
+            db.session.add(user_pref)
+
+        spotify_id = request.json.get('spotify_id')  # Assuming you're sending track URI in the request
+
+        # Check if track already exists
+        track = Track.query.filter_by(spotify_id=spotify_id).first()
+        if not track:
+            track_details = sp.track(spotify_id)
+            artist_detail = sp.artist(track_details['artists'][0]['id'])
+            genres = ', '.join(artist_detail['genres'])
+            
+            cloudinary_img_url = upload_image_to_cloudinary(track_details['album']['images'][0]['url'])
+            track = Track(
+                spotify_id=spotify_id,
+                name=track_details['name'],
+                album_id=track_details['album']['id'],
+                artists=','.join([artist['name'] for artist in track_details['artists']]),
+                duration_ms=track_details['duration_ms'],
+                popularity=track_details['popularity'],
+                preview_url=track_details['preview_url'],
+                release_date=track_details['album']['release_date'],
+                album_name=track_details['album']['name'],
+                album_release_date=track_details['album']['release_date'],
+                cloudinary_img_url=cloudinary_img_url,
+                track_genres=genres,
+            )
+            db.session.add(track)
+            db.session.commit()
+
+        user_pref.favorite_tracks.append(track)
+        db.session.commit()
+
+        return jsonify({'message': 'Track added to favorites successfully'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/personal/favourites/tracks', methods=['GET'])
+@jwt_required()
+def get_personal_favourites_tracks():
+    current_user_id = get_jwt_identity()
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+    if user_pref:
+        favorite_tracks = user_pref.favorite_tracks
+        serialized_tracks = []
+        for track in favorite_tracks:
+            serialized_tracks.append({
+                'id': track.id,
+                'name': track.name,
+                'artists': track.artists.split(','),
+                'duration': track.duration_ms,
+                'genres' : track.track_genres,
+                'release_date': track.album_release_date,
+                'spotify_image_url': track.cloudinary_img_url,
+                'spotify_id' : track.spotify_id
+            })
+        return jsonify({'favourite_tracks': serialized_tracks})
+    else:
+        return jsonify({'message': 'No favorite tracks found'}), 404
+    
+@app.route('/personal/favourites/track', methods=['DELETE'])
+@jwt_required()
+def delete_personal_favourites_track():
+    current_user_id = get_jwt_identity()
+    track_id = request.json.get('spotify_id')
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+    if user_pref:
+        track = Track.query.filter_by(spotify_id=track_id).first()
+        if track:
+            user_pref.favorite_tracks.remove(track)
+            db.session.commit()
+            return jsonify({'message': 'Track removed from favorites successfully'})
+        else:
+            return jsonify({'error': 'Track not found'}), 404
+    else:
+        return jsonify({'message': 'No favorite tracks found'}), 404
+    
+@app.route('/personal/favourites/track/check', methods=['POST'])
+@jwt_required()
+def check_favourite_track():
+    current_user_id = get_jwt_identity()
+    track_id = request.json.get('track_id')
+
+    # Get the UserPreference instance for the current user
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+    if user_pref:
+        # Check if any track in UserPreference.favorite_tracks has the spotify_id
+        is_favorite = any(track.id == track_id for track in user_pref.favorite_tracks)
+        return jsonify({'favourite' : is_favorite})
+    else:
+        return jsonify({'message': 'User preference not found'}), 404
+    
+    
+    
 # ----------------- PLAYBACK ------------------------- # 
 @app.route('/transfer-playback', methods=['POST'])
 def transfer_playback():
@@ -784,20 +890,35 @@ def toggle_repeat():
 @jwt_required()
 def seek():
     data = request.json
-    new_position_ms = int(data.get('newPositionMs'))
-    
-    access_token = redis.get('spotify_access_token').decode('utf-8')
-    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    # Get the current playback information
-    playback_info = sp.current_playback()
+    new_position_ms_str = data.get('newPositionMs')
+    if new_position_ms_str is not None:
+        new_position_ms = int(new_position_ms_str)
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+        playback_info = sp.current_playback()
 
-    # Check if a track is currently playing
-    if playback_info and playback_info['is_playing']:
-        # Seek to the new position
-        sp.seek_track(new_position_ms)  
-        return jsonify({'new_position': new_position_ms})
+        # Check if a track is currently playing
+        if playback_info and playback_info['is_playing']:
+            # Check if repeat mode is active
+            if playback_info['repeat_state'] != 'off':
+                # Temporarily disable repeat mode
+                sp.repeat('off')
+
+            # Seek to the new position
+            sp.seek_track(new_position_ms)
+
+            # Re-enable repeat mode if it was active
+            if playback_info['repeat_state'] != 'off':
+                sp.repeat(playback_info['repeat_state'])
+
+            return jsonify({'new_position': new_position_ms})
+        else:
+            return jsonify({'message': 'No track is currently playing'})
     else:
-        return jsonify({'message': 'No track is currently playing'})
+        print("Something wrong here")
+        return jsonify({'message': 'Invalid new position'}), 400
+    
+
 
 @app.route('/playback/current_track_position')    
 @jwt_required()
@@ -816,6 +937,7 @@ def spotify_current_track_position():
         current_track_position = 0
 
     return jsonify({'current_track_position': current_track_position})
+
 
 
 # -------------------------- ROOM ----------------------------
@@ -1223,6 +1345,16 @@ def login():
     access_token = create_access_token(identity=user.id)
     refresh_token = create_refresh_token(identity=user.id)
     
+    token_record = RefreshToken(
+    user_id=user.id,
+    jti=get_jti(refresh_token),
+    expires_in=datetime.fromtimestamp(decode_token(refresh_token)['exp'])
+    )
+
+    # Add the new RefreshToken to the database session and commit it
+    db.session.add(token_record)
+    db.session.commit()
+    
     profile = {
         'username': user.username,
         'email': user.email,
@@ -1240,9 +1372,6 @@ def check_auth():
         verify_jwt_in_request()
         return jsonify({'isAuthenticated': True}), 200
     except:
-        print("--------------------------------")
-        print("Something wrong here!")
-        print("--------------------------------")
         return jsonify({'isAuthenticated': False}), 401
 
 
@@ -1269,11 +1398,23 @@ def register():
 @app.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def refresh():
-    identity = get_jwt_identity()
-    access_token = create_access_token(identity=identity)
-    response = jsonify({'refresh': True, 'access_token' : access_token})
-    set_access_cookies(response, access_token)
-    return response, 200
+    # Get the current user's ID
+    current_user_id = get_jwt_identity()
+
+    # Get the JTI of the current refresh token
+    current_jti = get_jwt()["jti"]
+
+    # Check if the refresh token is in the database and not revoked
+    token_in_db = RefreshToken.query.filter_by(user_id=current_user_id, jti=current_jti, revoked=False).first()
+    if token_in_db is None:
+        return {"msg": "Refresh token not found in database"}, 401
+
+    # Create a new access token
+    new_access_token = create_access_token(identity=current_user_id)
+    refresh_token = token_in_db.token
+
+    # Return the new access token and the refresh token
+    return {"access_token": new_access_token, "refresh_token": refresh_token}, 200
 
 def refresh_spotify_token():
     
@@ -1332,8 +1473,8 @@ def get_user_profile():
     if not user:
         return jsonify({'message': 'User not found'}), 404
     profile_data = {
+        'id': current_user_id,
         'username': user.username,
-        'email': user.email,
         'role' : user.role,
     }
     return jsonify({"profile" : profile_data}), 200
