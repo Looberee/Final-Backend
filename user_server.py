@@ -7,6 +7,7 @@ from flask_jwt_extended import create_access_token, JWTManager, jwt_required, ge
 from flask_session import Session
 from flask_caching import Cache
 from flask_socketio import SocketIO, emit
+from flask_mail import Mail, Message
 
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
@@ -33,10 +34,18 @@ from models.UserPreference import UserPreference
 from models.Recommendation import Recommendation
 from models.RefreshToken import RefreshToken, insert_refresh_token
 from models.Genre import Genre
+from models.Room import Room
+from models.Payment import Payment
 from database import db
 
 import asyncio
 import aiohttp
+
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+import paypalrestsdk
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -82,26 +91,37 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 redis = FlaskRedis(app)
 cache = Cache(app, config={'CACHE_TYPE': 'simple'})
 
-
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:Delta1006@127.0.0.1/pyppo'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
 app.config['CORS_ENABLED'] = True
+
 app.config['JWT_SECRET_KEY'] = app.secret_key
 app.config['SECRET_KEY'] = app.secret_key
 app.config['SESSION_TYPE'] = 'filesystem'
 app.config['SESSION_PERMANENT'] = False  # Ensure session is not permanent
+
 app.config['REDIS_URL'] = "redis://:Delta1006@localhost:6379/0"
+
 app.config['JWT_TOKEN_LOCATION'] = ['cookies']
 app.config['JWT_COOKIE_SECURE'] = True
 app.config['JWT_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['JWT_COOKIE_CSRF_PROTECT'] = False
-# End configuring SQLAlchemy Database
+
+# app.config['MAIL_SERVER']='smtp.gmail.com'
+# app.config['MAIL_PORT'] = 587
+# app.config['MAIL_USERNAME'] = 'delta06coder@gmail.com'
+# app.config['MAIL_PASSWORD'] = '201675007leminhduc'
+# app.config['MAIL_USE_TLS'] = True
+# app.config['MAIL_USE_SSL'] = False
+# End configuring
 jwt = JWTManager(app)
 jwt.init_app(app)
 
 db.init_app(app)
 migrate = Migrate(app, db)
+mail = Mail(app)
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -123,6 +143,11 @@ sp_oauth = SpotifyOAuth(
     scope = 'user-library-read user-library-modify user-top-read app-remote-control streaming user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-modify-public user-read-private user-read-email playlist-read-private'
 
 )
+
+paypalrestsdk.configure({
+    "mode": "sandbox",  # sandbox or live
+    "client_id": "AfARXGhy5pQVvIf9tewEiRXNDZXQW8KhqC1BVL43euxM8XZkvY2fwP1JEu4Py1pJAOKdoKaDF38-JcRM",
+    "client_secret": "EE1DL1xlFI32ZFXZBVnkDGVqXdYmyh43FuQHSZDkRGS_K8V6vvARRa3obHwnfsUgZdLitXXFJP1QBBHN" })
 
 access_token = redis.get('spotify_access_token')
 
@@ -374,6 +399,7 @@ def delete_pyppo_user_playlists_by_id():
 def get_pyppo_user_playlists_by_id(encode_id):
     current_user_id = get_jwt_identity()
     playlist = UserPlaylist.query.filter_by(encode_id=encode_id, user_id = current_user_id).first()
+    user_preference = UserPreference.query.filter_by(user_id=current_user_id).first()
     if playlist:
         tracks = UserPlaylistTrack.query.filter_by(user_playlist_id=playlist.id).all()
         tracks_info = []
@@ -389,7 +415,7 @@ def get_pyppo_user_playlists_by_id(encode_id):
                     'duration': track.duration_ms,
                     'release_date': track.release_date,
                     'spotify_id' : track.spotify_id,
-                    # Add more track details as needed
+                    'is_favourite': track.id in [t.id for t in user_preference.favorite_tracks],  # Add this line
                 }
                 tracks_info.append(track_info)
         
@@ -744,15 +770,22 @@ def pyppo_play_track():
     device_id = request.json.get('myDeviceId')
     
     track_info = sp.track(track_uri)
-    track_name = track_info['name']
 
-    @retry(stop_max_attempt_number=3, wait_fixed=1000)
+    @retry(stop_max_attempt_number=3, wait_fixed=1000, retry_on_result=lambda result: result is False)
     def start_playback():
-        sp.start_playback(device_id=device_id, uris=[track_uri])
+        try:
+            sp.start_playback(device_id=device_id, uris=[track_uri])
+            time.sleep(1)
+            return True  # Success
+        except spotipy.SpotifyException as e:
+            if e.http_status == 404:  # No active device found
+                print("No active device found. Retrying...")
+                return False  # Retry
+            else:
+                raise  # Raise exception for other errors
 
     try:
         start_playback()
-        time.sleep(1)
         return jsonify({'success': True, 'message': 'Playback started successfully.'}), 200
     except Exception as e:
         return jsonify({'success': False, 'message': 'Failed to start playback: ' + str(e)}), 500
@@ -1258,6 +1291,28 @@ def recommend_tracks_by_genre(genre):
 #     artists = await get_cached_artists(genre)
 #     return jsonify(artists)
 
+# --------------------------- PAYPAL PAYMENT ----------------------- #
+
+@app.route('/paypal/payment/capture', methods=['POST'])
+@jwt_required()
+def paypal_capture():
+    data = request.json
+    user_id = get_jwt_identity()  # Get the user ID from the JWT
+
+    # Extract the relevant information from the data
+    transaction_id = data['id']
+    amount = float(data['purchase_units'][0]['amount']['value'])
+    currency = data['purchase_units'][0]['amount']['currency_code']
+    status = data['status']
+    email = data['payer']['email_address'] 
+    
+    payment = Payment(user_id, transaction_id, amount, currency, status, email)
+    
+    db.session.add(payment)
+    db.session.commit()
+    upgrade_to_premium(user_id)
+    return jsonify({"payload" : data}), 200
+
 # --------------------------- CALLBACK --------------------------- #    
 @app.route('/callback')
 def callback():
@@ -1506,13 +1561,58 @@ def upload_genres_image_to_cloudinary(image_url, genre_key):
     except Exception as e:
         print(f"Error uploading image to Cloudinary: {e}")
         return None
+    
+def send_email(sender_email, sender_password, recipient_email, subject, message):
+    try:
+        # SMTP Configuration
+        smtp_server = 'smtp.gmail.com'
+        smtp_port = 587
+
+        # Create SMTP object
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()  # Start TLS encryption
+        server.login(sender_email, sender_password)
+
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = 'Pyppo The Final'
+        msg['To'] = recipient_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(message, 'plain'))
+
+        # Send email
+        server.sendmail(sender_email, recipient_email, msg.as_string())
+        print("Email sent successfully!")
+        server.quit()
+
+    except smtplib.SMTPAuthenticationError as e:
+        print("SMTP Authentication Error:", e)
+        print("Check if username and password are correct.")
+        print("Also, ensure that you're not using 2-step verification.")
+    except Exception as e:
+        print("An error occurred:", e)
+        print("Please check your SMTP server settings and try again.")
+
+subject = 'Test Email'
+message = 'This is a test email sent using Python.'
+
+def upgrade_to_premium(user_id):
+    user = User.query.get(user_id)
+    user.role = 'premium'
+    db.session.commit()
+    return jsonify({'message': 'User upgraded to premium successfully'}), 200
+    
+@app.route('/send-mail')
+def send_thanks_mail():
+    send_email('dennisofcetus98@gmail.com', 'yuqm gfyd zdmi pjmg', 'delta06coder@gmail.com', subject=subject, message=message)
+    return "Email sent successfully"
 
 
 scheduler = BackgroundScheduler()
 scheduler.start()
 scheduler.add_job(
     func=check_token,
-    trigger=IntervalTrigger(seconds=15),  # Check the token every minute
+    trigger=IntervalTrigger(seconds=30),  # Check the token every minute
     id='check_token_job',
     name='Check if the Spotify token needs to be refreshed',
     replace_existing=True)
