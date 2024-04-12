@@ -117,12 +117,29 @@ def create_room():
     return jsonify({"msg": f"Room {room_name} created successfully", "room_id": new_room.id})
 
 @socketio.on('join')
+@jwt_required()
 def on_join(data):
-    username = data['username']
-    room = data['room']
-    join_room(room)
-    send({"msg": username + " has entered the room."}, room=room)
-    
+    current_id = get_jwt_identity()
+    user = User.query.filter_by(id=current_id).first()
+    room_id = data.get('room_id')
+    password = data.get('password')
+
+    # Assuming you have a function to check if the password is correct
+    if is_correct_password(room_id, password):
+        join_room(room_id)
+        send({"msg": user.username + " has entered the room.", "success": True}, room=room_id)
+        send({"msg": user.username + " has entered the room."}, room=room_id)  # Emit join message to room
+    else:
+        send({"msg": "Failed to join the room. Incorrect password.", "success": False})
+
+
+def is_correct_password(room_id, password):
+    room = Room.query.filter_by(id=room_id).first()
+    if room and room.password == password:
+        return True
+    else:
+        return False
+
 @socketio.on('leave')
 def on_leave(data):
     username = data['username']

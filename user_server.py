@@ -769,8 +769,6 @@ def pyppo_play_track():
     track_uri = request.json.get('trackUri')
     device_id = request.json.get('myDeviceId')
     
-    track_info = sp.track(track_uri)
-
     @retry(stop_max_attempt_number=3, wait_fixed=1000, retry_on_result=lambda result: result is False)
     def start_playback():
         try:
