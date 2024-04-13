@@ -1606,15 +1606,15 @@ def send_thanks_mail():
     return "Email sent successfully"
 
 
-scheduler = BackgroundScheduler()
-scheduler.start()
-scheduler.add_job(
-    func=check_token,
-    trigger=IntervalTrigger(seconds=30),  # Check the token every minute
-    id='check_token_job',
-    name='Check if the Spotify token needs to be refreshed',
-    replace_existing=True)
-atexit.register(lambda: scheduler.shutdown())
+# scheduler = BackgroundScheduler()
+# scheduler.start()
+# scheduler.add_job(
+#     func=check_token,
+#     trigger=IntervalTrigger(seconds=30),  # Check the token every minute
+#     id='check_token_job',
+#     name='Check if the Spotify token needs to be refreshed',
+#     replace_existing=True)
+# atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
     spotify_authorization()

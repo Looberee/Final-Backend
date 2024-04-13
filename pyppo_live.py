@@ -127,10 +127,15 @@ def on_join(data):
     # Assuming you have a function to check if the password is correct
     if is_correct_password(room_id, password):
         join_room(room_id)
-        send({"msg": user.username + " has entered the room.", "success": True}, room=room_id)
-        send({"msg": user.username + " has entered the room."}, room=room_id)  # Emit join message to room
+        send({"msg": user.username + " has entered the room.", "success": True, "user" : "Pyppo"}, room=room_id)
+        print("-------------")
+        print(user.username + " has entered the room: " + str(room_id))
+        print("-------------")
     else:
-        send({"msg": "Failed to join the room. Incorrect password.", "success": False})
+        emit('message', {"msg": "Failed to join the room. Incorrect password.", "success": False})
+        print("-------------")
+        print(user.username + " failed to join the room.")
+        print("-------------")
 
 
 def is_correct_password(room_id, password):
@@ -141,18 +146,30 @@ def is_correct_password(room_id, password):
         return False
 
 @socketio.on('leave')
+@jwt_required()
 def on_leave(data):
-    username = data['username']
-    room = data['room']
-    leave_room(room)
-    send({"msg": username + " has left the room."}, room=room)
+    current_id = get_jwt_identity()
+    user = User.query.filter_by(id=current_id).first()
+    room_id = data.get('room_id')
+    if room_id is None:
+        print("room_id not provided")
+        return
+    leave_room(room_id)
+    send({"msg": user.username + " has left the room.", "user" : user.username}, room=room_id)
+    print("-------------")
+    print(user.username + " has left the room: " + str(room_id))
+    print("-------------")
     
 @socketio.on('send_message')
+@jwt_required()
 def handle_send_message(data):
     msg = data['message']
-    room = data['room']
+    room_id = data['room_id']
+    current_id = get_jwt_identity()
+    user = User.query.filter_by(id=current_id).first()
     # Broadcast the message to all users in the room
-    send({"msg": msg}, room=room)
+    send({"msg": msg, 'user': user.username}, room=room_id)
+    print("Message: ", msg);
 
 @socketio.on('private_message')
 def private_message(payload):
