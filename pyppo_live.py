@@ -25,6 +25,7 @@ from threading import Thread
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 intents = discord.Intents.default()
+intents.voice_states = True
 
 pyppo_bot = commands.Bot(command_prefix='!', intents=intents)
 pyppo_token = 'MTIyNjQ5Nzk1NzE3MjM0Njk0MQ.GApILx.O4hBAGwdEn_Q2i3-w09RQPgLYmTRzLLY0ACC8g'
@@ -65,13 +66,17 @@ jwt = JWTManager(app)
 jwt.init_app(app)
 
 # -------------------- BOT COMMAND -------------------- #
-@pyppo_bot.command()
-async def pinfo(ctx):
-    await ctx.send("Hello, I am Pyppo! I am the manager of the playback that you will use later. If you want to play something, just type !pplay")
+# @pyppo_bot.command()
+# async def pinfo(ctx):
+#     await ctx.send("Hello, I am Pyppo! I am the manager of the playback that you will use later. If you want to play something, just type !pplay")
     
-@pyppo_bot.command()
-async def pchat(ctx):
-    await ctx.send("I have no idea what you are talking about")
+# @pyppo_bot.command()
+# async def pchat(ctx):
+#     await ctx.send("I have no idea what you are talking about")
+    
+# @pyppo_bot.command()
+# async def pplay(ctx, track_url):
+#     await ctx.send("Playing " + track_url)
     
 # --------------------- REAL-TIME EVENTS --------------------- #
 @app.route('/rooms', methods=['GET'])
@@ -97,7 +102,7 @@ def get_all_rooms():
 
     return jsonify({"all_rooms" : all_rooms}), 200
 
-@app.route('/rooms', methods=['POST'])
+@app.route('/room', methods=['POST'])
 @jwt_required()
 def create_room():
     room_name = request.json['room_name']
@@ -170,82 +175,89 @@ def handle_send_message(data):
     # Broadcast the message to all users in the room
     send({"msg": msg, 'user': user.username}, room=room_id)
     print("Message: ", msg);
-
-@socketio.on('private_message')
-def private_message(payload):
-    recipient_session_id = users[payload['username']]
-    message = payload['message']
-
-    emit('new_private_message', message, room=recipient_session_id)
     
-@socketio.on('typing')
-def handle_typing(data):
-    room = data['room']
-    user = data['username']
-    # Broadcast the typing event to all users in the room
-    emit('user_typing', {'user': user}, room=room)
-
+@socketio.on('command')
+@jwt_required()
+def socket_command(data):
+    msg = data['message']
+    room_id = data['room_id']
+    current_id = get_jwt_identity()
+    user = User.query.filter_by(id=current_id).first()
+    
+    if msg.startswith('!pplay'):
+        command, *song = msg.split(' ')
+        song = ' '.join(song)
+        print("Play command in server")
+        print("Track is: ", song)
+        send({"msg": f"{song} has been added to the queue - requested by {user.username} ", "success": True, "user" : "Pyppo"}, room=room_id)
+        
+    elif msg.startswith('!pchat'):
+        print("Chat command in server")
+    elif msg.startswith('!pinfo'):
+        print("Info command in server")
+        
+    
 def start_flask_server():
     socketio.run(app, debug=True, port=5001)
 
-bot_should_run = True
+# bot_should_run = True
 
-def start_discord_bot():
-    global bot_should_run
-    while bot_should_run:
-        pyppo_bot.run(pyppo_token)
-        pass
+# def start_discord_bot():
+#     global bot_should_run
+#     while bot_should_run:
+#         pyppo_bot.run(pyppo_token)
+#         pass
 
-@app.route('/authorize')
-def authorize():
-    params = {
-        'client_id': discord_auth['client_id'],
-        'redirect_uri': 'http://127.0.0.1:5001/callback',
-        'response_type': 'code',
-        'scope': 'bot connections'
-    }
+# @app.route('/authorize')
+# def authorize():
+#     params = {
+#         'client_id': discord_auth['client_id'],
+#         'redirect_uri': 'http://127.0.0.1:5001/callback',
+#         'response_type': 'code',
+#         'scope': 'bot connections'
+#     }
 
-    url = 'https://discord.com/api/oauth2/authorize?' + urlencode(params)
+#     url = 'https://discord.com/api/oauth2/authorize?' + urlencode(params)
 
-    return redirect(url)
+#     return redirect(url)
 
 
-@app.route('/callback')    
-def callback():
-    code = request.args.get('code')
+# @app.route('/callback')    
+# def callback():
+#     code = request.args.get('code')
     
-    # Check if the code is None
-    if code is None:
-        error = request.args.get('error')
-        return jsonify({'error': error}), 400
+#     # Check if the code is None
+#     if code is None:
+#         error = request.args.get('error')
+#         return jsonify({'error': error}), 400
     
-    # Prepare data for the token request
-    data = {
-        'client_id': discord_auth['client_id'],
-        'client_secret': discord_auth['client_secret'],
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': 'http://127.0.0.1:5001/callback',
-        'scope': 'bot connections'
-    }
+#     # Prepare data for the token request
+#     data = {
+#         'client_id': discord_auth['client_id'],
+#         'client_secret': discord_auth['client_secret'],
+#         'grant_type': 'authorization_code',
+#         'code': code,
+#         'redirect_uri': 'http://127.0.0.1:5001/callback',
+#         'scope': 'bot connections'
+#     }
     
-    # URL encode the data
-    data = urlencode(data)
+#     # URL encode the data
+#     data = urlencode(data)
     
-    # Send a POST request to the Discord token endpoint
-    response = requests.post('https://discord.com/api/oauth2/token', data=data, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+#     # Send a POST request to the Discord token endpoint
+#     response = requests.post('https://discord.com/api/oauth2/token', data=data, headers={'Content-Type': 'application/x-www-form-urlencoded'})
     
-    # Get the access token from the response
-    access_token = response.json().get('access_token')
-    info = response.json()
+#     # Get the access token from the response
+#     access_token = response.json().get('access_token')
+#     info = response.json()
 
-    return jsonify({"message" : "Callback received", "data" : data, 'info' : info})
+#     return jsonify({"message" : "Callback received", "data" : data, 'info' : info})
 
 # Start the pyppo_bot and Flask server concurrently
 if __name__ == "__main__":
     # Start the Discord bot in a new thread
-    discord_thread = threading.Thread(target=start_discord_bot, daemon=True)
-    discord_thread.start()
+    # discord_thread = threading.Thread(target=start_discord_bot, daemon=True)
+    # discord_thread.start()
 
     try:
         start_flask_server()
