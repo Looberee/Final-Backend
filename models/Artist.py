@@ -13,7 +13,7 @@ class Artist(db.Model):
     spotify_id = db.Column(db.String(255))
     name = db.Column(db.String(255), nullable=False)
     cloudinary_artist_image_url = db.Column(db.String(255))
-    genre = db.Column(db.String(100))
+    genres = db.Column(db.String(100))
     followers = db.Column(db.Integer)
     encode_id = db.Column(db.String(100), unique=True, nullable=True)
     
@@ -31,7 +31,7 @@ class Artist(db.Model):
         self.spotify_id = spotify_id
         self.name = name
         self.cloudinary_artist_image_url = cloudinary_artist_image_url
-        self.genre = genres
+        self.genres = genres
         self.followers = followers
         self.encode_id = self.encode_p_id()
         logger.info(f"Encoded ID generated for Artist '{self.name}': {self.encode_id}")

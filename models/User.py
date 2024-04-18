@@ -6,6 +6,7 @@ import logging
 from sqlalchemy.event import listens_for
 import random
 import string
+from sqlalchemy.orm import relationship
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ class User(db.Model, UserMixin):
     password_hash = db.Column(db.String(256), nullable=False)
     role = db.Column(db.String(50), nullable=False, default='regular')
     encode_id = db.Column(db.String(100), nullable=True, unique=True)
+    room_member = relationship('RoomMember', back_populates='user')
 
     def __init__(self, username, email, password):
         self.username = username

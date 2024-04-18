@@ -36,6 +36,8 @@ from models.RefreshToken import RefreshToken, insert_refresh_token
 from models.Genre import Genre
 from models.Room import Room
 from models.Payment import Payment
+from models.RoomMember import RoomMember
+from models.RoomTrack import RoomTrack
 from database import db
 
 import asyncio
@@ -109,19 +111,22 @@ app.config['JWT_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['JWT_COOKIE_CSRF_PROTECT'] = False
 
-# app.config['MAIL_SERVER']='smtp.gmail.com'
-# app.config['MAIL_PORT'] = 587
-# app.config['MAIL_USERNAME'] = 'delta06coder@gmail.com'
-# app.config['MAIL_PASSWORD'] = '201675007leminhduc'
-# app.config['MAIL_USE_TLS'] = True
-# app.config['MAIL_USE_SSL'] = False
+
 # End configuring
+
 jwt = JWTManager(app)
 jwt.init_app(app)
 
+# End init JWTManager
+
 db.init_app(app)
+# End init DB
+
 migrate = Migrate(app, db)
+# End init Flask-Migrate
+
 mail = Mail(app)
+# End init Mail
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -140,7 +145,7 @@ sp_oauth = SpotifyOAuth(
     client_id=client_id,
     client_secret=client_secret,
     redirect_uri=redirect_uri,
-    scope = 'user-library-read user-library-modify user-top-read app-remote-control streaming user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-modify-public user-read-private user-read-email playlist-read-private'
+    scope = 'user-library-read user-library-modify user-top-read app-remote-control streaming user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-modify-public user-read-private user-read-email playlist-read-private user-follow-modify'
 
 )
 
@@ -705,13 +710,15 @@ def delete_personal_favourites_track():
 def check_favourite_track():
     current_user_id = get_jwt_identity()
     track_id = request.json.get('track_id')
-
-    # Get the UserPreference instance for the current user
     user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
     if user_pref:
-        # Check if any track in UserPreference.favorite_tracks has the spotify_id
-        is_favorite = any(track.id == track_id for track in user_pref.favorite_tracks)
-        return jsonify({'favourite' : is_favorite})
+        if track_id:
+            is_favorite = any(track.id == track_id for track in user_pref.favorite_tracks)
+            return jsonify({'favourite' : is_favorite})
+        else:
+            spotify_id = request.json.get('spotify_id')
+            is_favorite = any(track.spotify_id == spotify_id for track in user_pref.favorite_tracks)
+            return jsonify({'favourite' : is_favorite})
     else:
         return jsonify({'message': 'User preference not found'}), 404
     
@@ -1194,23 +1201,7 @@ def recommend_artists_by_genre(genre):
     except spotipy.SpotifyException as e:
         return jsonify({'error': str(e)})
     
-# @app.route('/recommendation/artists/<genre>')
-# def recommend_artists_by_genre(genre):
-#     genre_str = str(genre)  # Convert genre to string
-#     cached_result = redis.get(genre_str)
-#     if cached_result:
-#         return cached_result.decode('utf-8')  # Decode the cached result
-    
-#     access_token = redis.get('spotify_access_token').decode('utf-8')
-#     sp = spotipy.Spotify(auth_manager=sp_oauth)
 
-#     try:
-#         sorted_artists = fetch_artists_by_genre(sp, genre_str)
-#         # Store the Python dictionary directly without JSON serialization
-#         redis.set(genre_str, str({'sorted_artists': sorted_artists}))
-#         return jsonify({'sorted_artists': sorted_artists})
-#     except spotipy.SpotifyException as e:
-#         return jsonify({'error': str(e)})
     
 def fetch_tracks_by_specific_genre(sp, genre):
     results = sp.search(q=f'genre:"{genre}"', type='track', limit=12)
@@ -1245,6 +1236,92 @@ def recommend_tracks_by_genre(genre):
         return jsonify({'sorted_tracks': sorted_tracks})
     except spotipy.SpotifyException as e:
         return jsonify({'error': str(e)})
+    
+# ------------------- ARTIST ------------------------ #
+@app.route('/artist/<path:artist_id>')
+def get_artist(artist_id):
+    # Check if the artist is already in the database
+    artist = Artist.query.filter_by(spotify_id=artist_id).first()
+
+    if artist:
+        # If the artist is found in the database, return the stored information
+        return jsonify({
+            'name': artist.name,
+            'image': artist.cloudinary_artist_image_url,
+            'genres': artist.genres,
+            'followers': artist.followers
+        })
+    else:
+        # If the artist is not found in the database, fetch the information from the Spotify API
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+        
+        artist_info = sp.artist(artist_id)
+        artist_name = artist_info['name']
+        artist_image = artist_info['images'][0]['url'] if artist_info['images'] else None
+        artist_genres = artist_info['genres']
+        artist_followers = artist_info['followers']['total']
+        
+        # Insert the artist information into the database
+        new_artist = Artist(spotify_id=artist_id, name=artist_name, cloudinary_artist_image_url=upload_image_to_cloudinary(artist_image), genres=', '.join(artist_genres), followers=artist_followers)
+        db.session.add(new_artist)
+        db.session.commit()
+        
+        # Return the fetched information
+        return jsonify({
+            'name': artist_name,
+            'image': artist_image,
+            'genres': artist_genres,
+            'followers': artist_followers
+        })
+        
+def fetch_artist_top_tracks(sp, artist_ids):
+    # Create a ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Use list comprehension to create a list of futures
+        futures = [executor.submit(fetch_top_tracks_for_artist, sp, artist_id) for artist_id in artist_ids]
+
+        # Gather the results as they become available
+        tracks = []
+        for future in concurrent.futures.as_completed(futures):
+            tracks.extend(future.result())
+
+    return jsonify(tracks)
+
+def fetch_top_tracks_for_artist(sp, artist_id):
+    # Create a new Spotify object inside this function
+    access_token = redis.get('spotify_access_token').decode('utf-8')
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+    
+    top_tracks = sp.artist_top_tracks(artist_id)
+
+    # Get artist name
+    artist_info = sp.artist(artist_id)
+    artist_name = artist_info['name']
+    
+    # Extract track information
+    tracks = []
+    for track in top_tracks['tracks']:
+        tracks.append({
+            "name": track["name"],
+            "duration": track["duration_ms"],
+            "spotify_id": track["id"],
+            "popularity": track["popularity"],
+            "spotify_image_url": track["album"]["images"][0]["url"],
+            "artists": artist_name
+        })
+
+    # Return only the first 6 tracks
+    return tracks[:6]
+
+@app.route('/artist/<path:artist_id>/top-tracks')
+@cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
+def fetch_top_tracks(artist_id):
+    access_token = redis.get('spotify_access_token').decode('utf-8')
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+    return jsonify(fetch_top_tracks_for_artist(sp, artist_id))  # Pass sp as an argument
+
+    
 
 
 # async def fetch_artists(session, genre):
@@ -1606,15 +1683,15 @@ def send_thanks_mail():
     return "Email sent successfully"
 
 
-# scheduler = BackgroundScheduler()
-# scheduler.start()
-# scheduler.add_job(
-#     func=check_token,
-#     trigger=IntervalTrigger(seconds=30),  # Check the token every minute
-#     id='check_token_job',
-#     name='Check if the Spotify token needs to be refreshed',
-#     replace_existing=True)
-# atexit.register(lambda: scheduler.shutdown())
+scheduler = BackgroundScheduler()
+scheduler.start()
+scheduler.add_job(
+    func=check_token,
+    trigger=IntervalTrigger(seconds=30),  # Check the token every minute
+    id='check_token_job',
+    name='Check if the Spotify token needs to be refreshed',
+    replace_existing=True)
+atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
     spotify_authorization()

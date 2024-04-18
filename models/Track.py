@@ -4,6 +4,7 @@ import logging
 from sqlalchemy.event import listens_for
 import random
 import string
+from sqlalchemy.orm import relationship
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ class Track(db.Model):
     cloudinary_img_url = db.Column(db.String(255))
     encode_id = db.Column(db.String(100), unique=True, nullable=True)
     track_genres = db.Column(db.String(255), nullable=True)  # Set nullable to True
+    room_track = relationship('RoomTrack', back_populates='track')
 
     def encode_p_id(self):
         random_string = ''.join(random.choices(string.ascii_letters + string.digits, k=5))

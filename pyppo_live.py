@@ -9,11 +9,14 @@ from werkzeug.security import generate_password_hash
 
 from models.Room import Room
 from models.User import User
+from models.RoomMember import RoomMember
+from models.RoomTrack import RoomTrack
 from database import db
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
+from datetime import datetime
 import asyncio
 import requests
 from urllib.parse import urlencode
@@ -131,11 +134,23 @@ def on_join(data):
 
     # Assuming you have a function to check if the password is correct
     if is_correct_password(room_id, password):
-        join_room(room_id)
-        send({"msg": user.username + " has entered the room.", "success": True, "user" : "Pyppo"}, room=room_id)
-        print("-------------")
-        print(user.username + " has entered the room: " + str(room_id))
-        print("-------------")
+        existing_member = RoomMember.query.filter_by(user_id=current_id, room_id=room_id).first()
+        if existing_member is not None:
+            emit('message', {"msg": "You are already in the room.", "success": False})
+            print("-------------")
+            print(user.username + " is already in the room.")
+            print("-------------")
+        else:
+            join_room(room_id)
+            members = get_member(room_id)
+            emit('member_list', {'member_list': members})
+            new_member = RoomMember(user_id=current_id, room_id=room_id, join_time=datetime.now())
+            db.session.add(new_member)
+            db.session.commit()
+            send({"msg": user.username + " has entered the room.", "success": True, "user" : "Pyppo"}, room=room_id)
+            print("-------------")
+            print(user.username + " has entered the room: " + str(room_id))
+            print("-------------")
     else:
         emit('message', {"msg": "Failed to join the room. Incorrect password.", "success": False})
         print("-------------")
@@ -159,11 +174,22 @@ def on_leave(data):
     if room_id is None:
         print("room_id not provided")
         return
-    leave_room(room_id)
-    send({"msg": user.username + " has left the room.", "user" : user.username}, room=room_id)
-    print("-------------")
-    print(user.username + " has left the room: " + str(room_id))
-    print("-------------")
+
+    existing_member = RoomMember.query.filter_by(user_id=current_id, room_id=room_id).first()
+    if existing_member is None:
+        emit('message', {"msg": "You are not in the room.", "success": False})
+        print("-------------")
+        print(user.username + " is not in the room.")
+        print("-------------")
+    else:
+        leave_room(room_id)
+        db.session.delete(existing_member)
+        db.session.commit()
+
+        send({"msg": user.username + " has left the room.", "user" : user.username}, room=room_id)
+        print("-------------")
+        print(user.username + " has left the room: " + str(room_id))
+        print("-------------")
     
 @socketio.on('send_message')
 @jwt_required()
@@ -195,6 +221,18 @@ def socket_command(data):
         print("Chat command in server")
     elif msg.startswith('!pinfo'):
         print("Info command in server")
+        
+@jwt_required()
+def get_member(room_id):
+    current_id = get_jwt_identity()
+    user = User.query.filter_by(id=current_id).first()
+    members = RoomMember.query.filter_by(room_id=room_id).all()
+    
+    member_list = []
+    for member in members:
+        member_list.append(member.user.username)
+    
+    return member_list
         
     
 def start_flask_server():
