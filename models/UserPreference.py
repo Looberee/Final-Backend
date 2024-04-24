@@ -5,6 +5,9 @@ from sqlalchemy.event import listens_for
 import random
 import string
 
+from .Artist import Artist
+from .Track import Track
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 

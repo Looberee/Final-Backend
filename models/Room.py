@@ -5,20 +5,16 @@ from sqlalchemy.event import listens_for
 import random
 import string
 from sqlalchemy.orm import relationship
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class Room(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(50), unique=True, nullable=False)
-    password = db.Column(db.String(255), nullable=True)
-    room_type = db.Column(db.String(50), nullable=False, default='public')
     host_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     creation_time = db.Column(db.DateTime, default=db.func.current_timestamp())
     encode_id = db.Column(db.String(255), nullable=True)
     room_member = relationship('RoomMember', back_populates='room')
-    room_track = relationship('RoomTrack', back_populates='room')
     
     def encode_p_id(self):
         random_string = ''.join(random.choices(string.ascii_letters + string.digits, k=5))
@@ -30,10 +26,8 @@ class Room(db.Model):
         decoded_id_with_suffix = base64.b64decode(encoded_id).decode()
         return int(decoded_id_with_suffix.replace('room', ''))
     
-    def __init__(self, name, password, room_type, host_id):
+    def __init__(self, name, host_id):
         self.name = name
-        self.password = password
-        self.room_type = room_type
         self.host_id = host_id
         self.encode_id = self.encode_p_id()
         

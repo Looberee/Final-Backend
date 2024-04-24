@@ -11,6 +11,8 @@ from sqlalchemy.orm import relationship
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from .RoomMember import RoomMember
+
 class User(db.Model, UserMixin):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True, nullable=False)

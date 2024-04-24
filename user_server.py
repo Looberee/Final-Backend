@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, make_response, current_app, redirect, session, url_for
+from flask import Flask, request, jsonify, make_response, current_app, redirect, session, url_for, render_template
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
@@ -8,6 +8,9 @@ from flask_session import Session
 from flask_caching import Cache
 from flask_socketio import SocketIO, emit
 from flask_mail import Mail, Message
+from flask_restx import Api, Resource, fields
+from flask_redis import FlaskRedis
+
 
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
@@ -37,15 +40,17 @@ from models.Genre import Genre
 from models.Room import Room
 from models.Payment import Payment
 from models.RoomMember import RoomMember
-from models.RoomTrack import RoomTrack
+from models.Admin import Admin
 from database import db
 
 import asyncio
 import aiohttp
 
 import smtplib
+
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+
 
 import paypalrestsdk
 
@@ -65,15 +70,16 @@ from cloudinary.utils import cloudinary_url
 #End importing Cloudinary API
 
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import cached_property
 #End import werkzeug
 
-from flask_redis import FlaskRedis
+
 
 import base64
 import requests
 from urllib.parse import urlencode
 from base64 import b64encode
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import json
 from threading import Thread
@@ -81,7 +87,9 @@ from threading import Thread
 
 
 app = Flask(__name__, instance_relative_config=True)
-
+# api.init_app(app)
+# app.register_blueprint(api.blueprint)
+# api = Api(app)
 app.secret_key = 'Delta1006'
 
 
@@ -183,6 +191,11 @@ def pyppo_decode_id(id):
     return int(base64.b64decode(id).decode())
 
 #All endpoints must return a jsonify data
+
+@app.route('/')
+def index():
+    return jsonify({"Status" : "OK"}, 200)
+
 def fetch_playlist_tracks(sp, playlist_id):
     playlist = sp.playlist(playlist_id)
     tracks = playlist["tracks"]["items"]
@@ -198,12 +211,12 @@ def format_tracks(tracks):
         'spotify_image_url': track['track']['album']['images'][0]['url']
     } for i, track in enumerate(tracks)]
 
-@app.route('/')
+@app.route('/home')
 def get_pyppo_dashboard():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
     
-    tracks = Track.query.with_entities(Track.id, Track.spotify_id, Track.name, Track.artists).order_by(Track.popularity.desc()).limit(6).all()
+    tracks = Track.query.with_entities(Track.id, Track.spotify_id, Track.name, Track.artists, Track.cloudinary_img_url).order_by(Track.popularity.desc()).limit(6).all()
     tracks = [track._asdict() for track in tracks] 
 
     # Define playlist IDs
@@ -279,7 +292,7 @@ def get_pyppo_tracks_by_id(track_id):
 # -------------- SEARCH -------------------- #    
 @app.route('/search')
 def get_pyppo_search_by_query():
-    access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
+    access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)  
     search_query = request.args.get('query')
 
@@ -291,12 +304,13 @@ def get_pyppo_search_by_query():
         # Process tracks from the database
         for track in database_tracks:
             track_info.append({
+                'type': 'track',
                 'id': track.id,
                 'spotify_id': track.spotify_id,
                 'name': track.name,
                 'artists': track.artists,
                 'duration' : track.duration_ms,
-                'spotify_image_url': track.cloudinary_img_url  # Include Spotify image URL
+                'spotify_image_url': track.cloudinary_img_url
             })
             
         # Check if there are enough tracks in the database
@@ -312,15 +326,50 @@ def get_pyppo_search_by_query():
             for track in tracks_from_spotify:
                 # Add track information to the response
                 track_info.append({
+                    'type': 'track',
                     'id' : tracks_from_spotify.index(track) + 1,
                     'spotify_id': track['id'],
                     'name': track['name'],
                     'artists': track['artists'][0]['name'],
                     'duration': track['duration_ms'],
-                    'spotify_image_url': track['album']['images'][0]['url']  # Get image URL from Spotify
+                    'spotify_image_url': track['album']['images'][0]['url']
                 })
 
-        return jsonify({'search_results': track_info})
+        # Search for artists in the database
+        database_artists = Artist.query.filter(Artist.name.ilike(f'%{search_query}%')).limit(6).all()
+        artist_info = []
+
+        # Process artists from the database
+        for artist in database_artists:
+            artist_info.append({
+                'type': 'artist',
+                'id': artist.id,
+                'name': artist.name,
+                'artist_id': artist.spotify_id,
+                'spotify_image_url': artist.cloudinary_artist_image_url
+            })
+            
+        # Check if there are enough artists in the database
+        if len(artist_info) < 6:
+            # Determine how many additional artists are needed
+            remaining_artists_count = 6 - len(artist_info)
+
+            # Search for additional artists using the Spotify API
+            spotify_artist_results = sp.search(q=search_query, type='artist', limit=remaining_artists_count)
+            artists_from_spotify = spotify_artist_results.get('artists', {}).get('items', [])
+
+            # Extract relevant information from each artist and add it to the response
+            for artist in artists_from_spotify:
+                # Add artist information to the response
+                artist_info.append({
+                    'type': 'artist',
+                    'id' : artists_from_spotify.index(artist) + 1,
+                    'name': artist['name'],
+                    'artist_id': artist['id'],
+                    'spotify_image_url': artist['images'][0]['url'] if artist['images'] else None
+                })
+
+        return jsonify({'search_results': track_info, 'artists_results' :artist_info})
 
     except spotipy.SpotifyException as e:
         # Handle Spotify API errors
@@ -618,7 +667,7 @@ def get_recent_tracks():
     
 @app.route('/personal/favourites/track', methods=['POST'])
 @jwt_required()
-def personal_favourites_tracks():
+def add_personal_favourites_tracks():
     try:
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -722,7 +771,101 @@ def check_favourite_track():
     else:
         return jsonify({'message': 'User preference not found'}), 404
     
+@app.route('/personal/favourites/artist', methods=['POST'])
+@jwt_required()
+def add_personal_favourite_artist():
+    current_user_id = get_jwt_identity()
+    artist_id = request.json.get('artist_id')
+    if artist_id is None:
+        return jsonify({'message': 'Missing artist_id'}), 400
+
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+    if not user_pref:
+        # Create a new UserPreference instance
+        user_pref = UserPreference(user_id=current_user_id)
+        db.session.add(user_pref)
+        db.session.commit()
+
+    artist = Artist.query.filter_by(spotify_id=artist_id).first()
+    if not artist:
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+        artist_data = sp.artist(artist_id)
+        genres = ', '.join(artist_data['genres'])
+        cloudinary_artist_image_url = upload_image_to_cloudinary(artist_data['images'][0]['url'])
+        artist = Artist(
+            spotify_id=artist_id,
+            name=artist_data['name'],
+            genres=genres,
+            cloudinary_artist_image_url=cloudinary_artist_image_url,
+            followers=artist_data['followers']['total']  # Set initial followers count
+        )
+        db.session.add(artist)
+    else:
+        artist.followers += 1
+
+    user_pref.favorite_artists.append(artist)
+    db.session.commit()
+    return jsonify({'message': 'Artist added to favorites successfully'})
+
+@app.route('/personal/favourites/artists', methods=['GET'])
+@jwt_required()
+def get_personal_favourite_artists():
+    current_user_id = get_jwt_identity()
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+    if user_pref:
+        favorite_artists = user_pref.favorite_artists
+        serialized_artists = []
+        for artist in favorite_artists:
+            serialized_artists.append({
+                'id': artist.id,
+                'name': artist.name,
+                'genres': artist.genres.split(','),
+                'spotify_image_url': artist.cloudinary_artist_image_url,
+                'artist_id': artist.spotify_id,
+                'followers' : artist.followers
+            })
+        return jsonify({'favorite_artists': serialized_artists})
+    else:
+        return jsonify({'message': 'No favorite artists found'}), 404
     
+@app.route('/personal/favourites/artist', methods=['DELETE'])
+@jwt_required()
+def delete_personal_favourites_artist():
+    current_user_id = get_jwt_identity()
+    artist_id = request.json.get('artist_id')
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+    if user_pref:
+        artist = Artist.query.filter_by(spotify_id=artist_id).first()
+        if artist:  
+            # Decrement the followers count by 1
+            if artist.followers > 0:
+                artist.followers -= 1
+
+            user_pref.favorite_artists.remove(artist)
+            db.session.commit()
+            return jsonify({'message': 'Artist removed from favorites successfully'})
+        else:
+            return jsonify({'error': 'Artist not found'}), 404
+    else:
+        return jsonify({'message': 'No favorite artists found'}), 404
+    
+@app.route('/personal/favourites/artist/check', methods=['POST'])
+@jwt_required()
+def check_favourite_artist():
+    current_user_id = get_jwt_identity()
+    artist_id = request.json.get('artist_id')
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+    if user_pref:
+        if artist_id:
+            is_favorite = any(artist.spotify_id == artist_id for artist in user_pref.favorite_artists)
+            return jsonify({'favourite' : is_favorite})
+        else:
+            spotify_id = request.json.get('spotify_id')
+            is_favorite = any(artist.spotify_id == spotify_id for artist in user_pref.favorite_artists)
+            return jsonify({'favourite' : is_favorite})
+    else:
+        return jsonify({'message': 'User preference not found'}), 404
     
 # ----------------- PLAYBACK ------------------------- # 
 @app.route('/transfer-playback', methods=['POST'])
@@ -779,15 +922,19 @@ def pyppo_play_track():
     @retry(stop_max_attempt_number=3, wait_fixed=1000, retry_on_result=lambda result: result is False)
     def start_playback():
         try:
+
             sp.start_playback(device_id=device_id, uris=[track_uri])
             time.sleep(1)
             return True  # Success
         except spotipy.SpotifyException as e:
             if e.http_status == 404:  # No active device found
                 print("No active device found. Retrying...")
+                refresh_spotify_token()
                 return False  # Retry
+            elif e.http_status == 500:
+                refresh_spotify_token()
             else:
-                raise  # Raise exception for other errors
+                raise# Raise exception for other errors
 
     try:
         start_playback()
@@ -957,7 +1104,6 @@ def seek():
         return jsonify({'message': 'Invalid new position'}), 400
     
 
-
 @app.route('/playback/current_track_position')    
 @jwt_required()
 def spotify_current_track_position():
@@ -975,81 +1121,6 @@ def spotify_current_track_position():
         current_track_position = 0
 
     return jsonify({'current_track_position': current_track_position})
-
-
-
-# -------------------------- ROOM ----------------------------
-@socketio.on('test')
-def handle_my_event(data):
-    print("------------------------")
-    print('received data: ' + data.get('message'))
-    print("------------------------")
-
-@socketio.on('join_room')
-def join_room(data):
-    room_id = data.get('room_id')
-    username = data.get('username')
-    join_room(room_id)
-    emit('user_joined', {'username': username, 'room_id': room_id}, room=room_id)
-
-@socketio.on('create_room')
-def create_room(data):
-    room_id = generate_room_id(5)  # Implement your own logic to generate a unique room ID
-    username = data.get('username')
-    join_room(room_id)
-    emit('room_created', {'room_id': room_id}, room=room_id)
-    emit('user_joined', {'username': username, 'room_id': room_id}, room=room_id)
-
-@socketio.on('invite_people')
-def invite_people(data):
-    room_id = data.get('room_id')
-    invited_users = data.get('invited_users')
-    emit('invitation_sent', {'room_id': room_id, 'invited_users': invited_users}, room=room_id)
-
-@socketio.on('send_message')
-def send_message(data):
-    room_id = data.get('room_id')
-    message = data.get('message')
-    username = data.get('username')
-    emit('receive_message', {'message': message, 'username': username}, room=room_id)
-    
-@socketio.on('room/playback/play')
-def on_play(data):
-    room_id = data.get('room_id')
-    track_uri = data.get('track_uri')
-    device_id = data.get('device_id')
-    emit('room/playback/play', {'track_uri': track_uri, 'device_id': device_id}, room=room_id)
-
-@socketio.on('room/playback/pause')
-def on_pause(data):
-    room_id = data.get('room_id')
-    device_id = data.get('device_id')
-    emit('room/playback/pause', {'device_id': device_id}, room=room_id)
-    
-@socketio.on('room/playback/next')
-def on_next(data):
-    room_id = data.get('room_id')
-    device_id = data.get('device_id')
-    emit('room/playback/next', {'device_id': device_id}, room=room_id)
-    
-@socketio.on('room/playback/previous')
-def on_previous(data):
-    room_id = data.get('room_id')
-    device_id = data.get('device_id')
-    emit('room/playback/previous', {'device_id': device_id}, room=room_id)
-    
-@socketio.on('room/playback/seek')
-def on_seek(data):
-    room_id = data.get('room_id')
-    new_position_ms = data.get('new_position_ms')
-    device_id = data.get('device_id')
-    emit('room/playback/seek', {'new_position_ms': new_position_ms, 'device_id': device_id}, room=room_id)
-
-@socketio.on('room/playback/resume')
-def on_resume(data):
-    room_id = data.get('room_id')
-    device_id = data.get('device_id')
-    emit('room/playback/resume', {'device_id': device_id}, room=room_id)
 
 # def monitor_playback_status():
 #     access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -1462,28 +1533,29 @@ def get_access_token(code):
 def login():
     username = request.json.get('username')
     password = request.json.get('password')
+
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
 
     user = User.query.filter_by(username=username).first()
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
 
-    if not check_password_hash(user.password_hash, password):
-        return jsonify({'error': 'Invalid password'}), 400
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify({'error': 'Invalid username or password'}), 401
 
-    access_token = create_access_token(identity=user.id)
-    refresh_token = create_refresh_token(identity=user.id)
-    
-    token_record = RefreshToken(
-    user_id=user.id,
-    jti=get_jti(refresh_token),
-    expires_in=datetime.fromtimestamp(decode_token(refresh_token)['exp'])
-    )
+    # Check if a refresh token exists for the user
+    existing_refresh_token = RefreshToken.query.filter_by(user_id=user.id).first()
 
-    # Add the new RefreshToken to the database session and commit it
-    db.session.add(token_record)
-    db.session.commit()
+    if existing_refresh_token:
+        # Use existing refresh token
+        refresh_token = existing_refresh_token.jti
+    else:
+        # Create a new refresh token
+        refresh_token = create_refresh_token(identity=user.id)
+        # Save the new refresh token to the database
+        insert_refresh_token(refresh_token, user.id)
+
+    # Create a new access token with a 3-day expiry time
+    access_token = create_access_token(identity=user.id, expires_delta=timedelta(days=3))
     
     profile = {
         'username': user.username,
@@ -1491,10 +1563,12 @@ def login():
         'role': user.role
     }
 
-    response = jsonify({'profile': profile, 'login': True, 'access_token' : access_token, 'refresh_token' : refresh_token, 'spotify_token' : redis.get('spotify_access_token').decode('utf-8')})
+    response = jsonify({'profile': profile, 'login': True, 'access_token': access_token, 'refresh_token': refresh_token, 'spotify_token' : redis.get('spotify_access_token').decode('utf-8')})
     set_access_cookies(response, access_token)
     set_refresh_cookies(response, refresh_token)
+    
     return response, 200
+
 
 @app.route('/check-auth', methods=['GET'])
 def check_auth():
@@ -1637,7 +1711,7 @@ def upload_genres_image_to_cloudinary(image_url, genre_key):
         print(f"Error uploading image to Cloudinary: {e}")
         return None
     
-def send_email(sender_email, sender_password, recipient_email, subject, message):
+def send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars):
     try:
         # SMTP Configuration
         smtp_server = 'smtp.gmail.com'
@@ -1653,7 +1727,12 @@ def send_email(sender_email, sender_password, recipient_email, subject, message)
         msg['From'] = 'Pyppo The Final'
         msg['To'] = recipient_email
         msg['Subject'] = subject
-        msg.attach(MIMEText(message, 'plain'))
+
+        # Render HTML template
+        html_content = render_template(template_name, **template_vars)
+
+        # Attach HTML content
+        msg.attach(MIMEText(html_content, 'html'))
 
         # Send email
         server.sendmail(sender_email, recipient_email, msg.as_string())
@@ -1679,9 +1758,8 @@ def upgrade_to_premium(user_id):
     
 @app.route('/send-mail')
 def send_thanks_mail():
-    send_email('dennisofcetus98@gmail.com', 'yuqm gfyd zdmi pjmg', 'delta06coder@gmail.com', subject=subject, message=message)
+    send_email('dennisofcetus98@gmail.com', 'yuqm gfyd zdmi pjmg', 'delta06coder@gmail.com', subject=subject, template_name='thank_mail.html', name='John', age=30)
     return "Email sent successfully"
-
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -1692,6 +1770,21 @@ scheduler.add_job(
     name='Check if the Spotify token needs to be refreshed',
     replace_existing=True)
 atexit.register(lambda: scheduler.shutdown())
+
+# -------------- HEATH CHECK -----------------# 
+@app.route('/healthcheck', methods=['GET'])
+def healthcheck():
+    try:
+        # Try to query the database
+        db.session.query("1").from_statement("SELECT 1").all()
+        return jsonify({"status": "OK"}), 200
+    except Exception as e:
+        # If an error occurred, return a 500 status code and the error message
+        return jsonify({"status": "Error", "message": str(e)}), 500
+    
+# @app.route('/api')
+# def redirect_to_swagger():
+#     return redirect(url_for('index'))
 
 if __name__ == '__main__':
     spotify_authorization()

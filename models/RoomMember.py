@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from database import db  # Assuming db is your SQLAlchemy instance
+from .Room import Room
 
 class RoomMember(db.Model):
     __tablename__ = 'room_member'
