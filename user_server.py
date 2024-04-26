@@ -212,6 +212,7 @@ def format_tracks(tracks):
     } for i, track in enumerate(tracks)]
 
 @app.route('/home')
+@cache.cached(timeout=3600) 
 def get_pyppo_dashboard():
     access_token = redis.get('spotify_access_token').decode('utf-8')
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -263,32 +264,6 @@ def get_cookies():
 
     return "Check your console for cookie information!"
 
-# ----------- TRACKS --------------- #
-@app.route('/tracks/<path:track_id>')
-def get_pyppo_tracks_by_id(track_id):
-    sp = spotipy.Spotify(auth_manager=sp_oauth)
-
-    try:
-        # Get track information using the Spotify API
-        track_info = sp.track(track_id)
-
-        # Extract relevant information from the track_info dictionary
-        response = {
-            'name': track_info['name'],
-            'artist': track_info['artists'][0]['name'],
-            'album': track_info['album']['name'],
-            'release_date': track_info['album']['release_date'],
-            'uri': track_info['uri'],
-            'image_url': track_info['album']['images'][0]['url'] if 'images' in track_info['album'] else None
-        }
-
-        return jsonify(response)
-
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)})
-    
-    
-    
 # -------------- SEARCH -------------------- #    
 @app.route('/search')
 def get_pyppo_search_by_query():
@@ -389,7 +364,8 @@ def get_all_pyppo_user_playlists():
             'id': playlist.id,
             'name': playlist.name,
             'tracks_count': tracks_count,
-            'encode_id' : playlist.encode_id
+            'encode_id' : playlist.encode_id,
+
         }
         playlists_info.append(playlist_info)
 
@@ -469,7 +445,7 @@ def get_pyppo_user_playlists_by_id(encode_id):
                     'duration': track.duration_ms,
                     'release_date': track.release_date,
                     'spotify_id' : track.spotify_id,
-                    'is_favourite': track.id in [t.id for t in user_preference.favorite_tracks],  # Add this line
+                    'is_favourite': track.id in [t.id for t in user_preference.favorite_tracks] if user_preference and user_preference.favorite_tracks else False
                 }
                 tracks_info.append(track_info)
         
@@ -809,6 +785,7 @@ def add_personal_favourite_artist():
     return jsonify({'message': 'Artist added to favorites successfully'})
 
 @app.route('/personal/favourites/artists', methods=['GET'])
+@cache.cached(timeout=3600) 
 @jwt_required()
 def get_personal_favourite_artists():
     current_user_id = get_jwt_identity()
@@ -941,25 +918,6 @@ def pyppo_play_track():
         return jsonify({'success': True, 'message': 'Playback started successfully.'}), 200
     except Exception as e:
         return jsonify({'success': False, 'message': 'Failed to start playback: ' + str(e)}), 500
-
-
-# @socketio.on('playTrack')
-# def pyppo_play_track_socketio(data):
-#     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
-#     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-
-#     track_uri = data['trackUri']
-#     device_id = data['myDeviceId']
-
-#     @retry(stop_max_attempt_number=3, wait_fixed=1000)
-#     def start_playback():
-#         sp.start_playback(device_id=device_id, uris=[track_uri])
-
-#     try:
-#         start_playback()
-#         emit('trackStarted', {'current_track': track_uri})
-#     except Exception as e:
-#         print('Failed to start playback: ' + str(e))
 
 @app.route('/playback/pause', methods=['POST'])
 @jwt_required()
@@ -1104,7 +1062,7 @@ def seek():
         return jsonify({'message': 'Invalid new position'}), 400
     
 
-@app.route('/playback/current_track_position')    
+@app.route('/playback/current_track_position')
 @jwt_required()
 def spotify_current_track_position():
     access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -1147,68 +1105,69 @@ def spotify_current_track_position():
 
 
 # -------------------------------- GENRES --------------------------------#
-@app.route('/genres')
-def get_genres():
-    access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
-    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+# @app.route('/genres')
+# def get_genres():
+#     access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
+#     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
     
-    genres = sp.recommendation_genre_seeds();
+#     genres = sp.recommendation_genre_seeds();
     
-    return jsonify({'genres': genres})
+#     return jsonify({'genres': genres})
 
 
-def map_genres_to_cloudinary():
-    access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
-    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+# def map_genres_to_cloudinary():
+#     access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
+#     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
     
-    try:
-        # Fetch recommendation genre seeds from Spotify
-        results = sp.recommendation_genre_seeds()
-        genres = results.get('genres', [])
+#     try:
+#         # Fetch recommendation genre seeds from Spotify
+#         results = sp.recommendation_genre_seeds()
+#         genres = results.get('genres', [])
 
-        # Select 1/6 of the genres randomly
-        selected_genres = genres[:21]
+#         # Select 1/6 of the genres randomly
+#         selected_genres = genres[:21]
 
-        # # Prepare a list of 21 image URLs (for illustration purposes)
-        image_urls = [
-            "https://w.wallhaven.cc/full/mp/wallhaven-mpwv6m.jpg", # Acoustic
-            "https://t4.ftcdn.net/jpg/05/86/74/11/360_F_586741137_iWeW0ZxOk4V8jckwq15e2B4Y4OBAiLrY.jpg", # Afrobeat
-            "https://s3.amazonaws.com/allprograms/wp-content/uploads/2023/07/13143904/music_blog_artist_musician_concert_show_stage.jpg", #Alternative Rock
-            "https://stability-images-upload.s3.amazonaws.com/v1_txt2img_5cab3348-013f-490c-a186-b39c8bfae9bd.png", # Alternative
-            "https://gstatic.gvn360.com/2022/04/Comment-obtenir-plus-de-graines-dorees-dans-Elden-Ring.jpg", # Ambient
-            "https://w.wallhaven.cc/full/pk/wallhaven-pkqdve.png", #Anime
-            "https://cdnb.artstation.com/p/assets/images/images/043/963/973/large/jota-cravo-to-the-grave-3.jpg?1638752111", # Black Metal
-            "https://www.greenlightbooking.com/wp-content/uploads/2018/06/lonesomefolktriobluegrassperformersoutside.jpg", # Bluegrass
-            "https://media.tegna-media.com/assets/WATN/images/ec679d63-4cbb-4590-b753-090b91f5b7d6/ec679d63-4cbb-4590-b753-090b91f5b7d6_1140x641.jpg", # Blues
-            "https://i.pinimg.com/736x/73/a0/43/73a043e6119fb6d026a17bf50b3a080d.jpg", # Bossa Nova
-            "https://www.celebritycruises.com/blog/content/uploads/2021/09/what-is-brazil-known-for-christ-the-redeemer-aerial-hero.jpg", # Brazilian
-            "https://blog.native-instruments.com/wp-content/uploads/2022/10/how-to-make-breakbeat-featured.jpg", # Breakbeat
-            "https://routenote.com/blog/wp-content/uploads/2017/01/music-British-flag.jpg", # British
-            "https://generasiantemp.files.wordpress.com/2021/03/cantopop-1-1.jpg?w=950", # Cantopop
-            "https://i.pinimg.com/474x/06/6b/3a/066b3a74d3daf479c6edc7e93cf73a81.jpg", # Chicago House
-            "https://www.childrens.com/wps/wcm/connect/childrenspublic/127c624b-8804-4e3b-8b83-a27fd8bb23bc/shutterstock_558144412_800x480.jpg?MOD=AJPERES&CVID=", # Children's Music
-            "https://www.wearetheguard.com/sites/default/files/best-chill-music-week-01-2019.jpg", # Chill
-            "https://img.apmcdn.org/c75e4ad850e43237fe0568a59ab71b15cb2511ac/uncropped/b80d45-20120627-flute-concert.jpg", # Classical
-            "https://assets-global.website-files.com/65496b1500aed8ad52a5a193/654d8d74f8e0ef605d28b38c_745c24f2-480b-4cb1-8675-4840178a4c07_StageEffects.jpeg", # Club
-            "https://i.ytimg.com/vi/L9PPPufTamE/maxresdefault.jpg", # Comedy
-            "https://thesouthtexan.com/wp-content/uploads/2023/12/149232937_country-music.jpg", # Country
-        ]
+#         # # Prepare a list of 21 image URLs (for illustration purposes)
+#         image_urls = [
+#             "https://w.wallhaven.cc/full/mp/wallhaven-mpwv6m.jpg", # Acoustic
+#             "https://t4.ftcdn.net/jpg/05/86/74/11/360_F_586741137_iWeW0ZxOk4V8jckwq15e2B4Y4OBAiLrY.jpg", # Afrobeat
+#             "https://s3.amazonaws.com/allprograms/wp-content/uploads/2023/07/13143904/music_blog_artist_musician_concert_show_stage.jpg", #Alternative Rock
+#             "https://stability-images-upload.s3.amazonaws.com/v1_txt2img_5cab3348-013f-490c-a186-b39c8bfae9bd.png", # Alternative
+#             "https://gstatic.gvn360.com/2022/04/Comment-obtenir-plus-de-graines-dorees-dans-Elden-Ring.jpg", # Ambient
+#             "https://w.wallhaven.cc/full/pk/wallhaven-pkqdve.png", #Anime
+#             "https://cdnb.artstation.com/p/assets/images/images/043/963/973/large/jota-cravo-to-the-grave-3.jpg?1638752111", # Black Metal
+#             "https://www.greenlightbooking.com/wp-content/uploads/2018/06/lonesomefolktriobluegrassperformersoutside.jpg", # Bluegrass
+#             "https://media.tegna-media.com/assets/WATN/images/ec679d63-4cbb-4590-b753-090b91f5b7d6/ec679d63-4cbb-4590-b753-090b91f5b7d6_1140x641.jpg", # Blues
+#             "https://i.pinimg.com/736x/73/a0/43/73a043e6119fb6d026a17bf50b3a080d.jpg", # Bossa Nova
+#             "https://www.celebritycruises.com/blog/content/uploads/2021/09/what-is-brazil-known-for-christ-the-redeemer-aerial-hero.jpg", # Brazilian
+#             "https://blog.native-instruments.com/wp-content/uploads/2022/10/how-to-make-breakbeat-featured.jpg", # Breakbeat
+#             "https://routenote.com/blog/wp-content/uploads/2017/01/music-British-flag.jpg", # British
+#             "https://generasiantemp.files.wordpress.com/2021/03/cantopop-1-1.jpg?w=950", # Cantopop
+#             "https://i.pinimg.com/474x/06/6b/3a/066b3a74d3daf479c6edc7e93cf73a81.jpg", # Chicago House
+#             "https://www.childrens.com/wps/wcm/connect/childrenspublic/127c624b-8804-4e3b-8b83-a27fd8bb23bc/shutterstock_558144412_800x480.jpg?MOD=AJPERES&CVID=", # Children's Music
+#             "https://www.wearetheguard.com/sites/default/files/best-chill-music-week-01-2019.jpg", # Chill
+#             "https://img.apmcdn.org/c75e4ad850e43237fe0568a59ab71b15cb2511ac/uncropped/b80d45-20120627-flute-concert.jpg", # Classical
+#             "https://assets-global.website-files.com/65496b1500aed8ad52a5a193/654d8d74f8e0ef605d28b38c_745c24f2-480b-4cb1-8675-4840178a4c07_StageEffects.jpeg", # Club
+#             "https://i.ytimg.com/vi/L9PPPufTamE/maxresdefault.jpg", # Comedy
+#             "https://thesouthtexan.com/wp-content/uploads/2023/12/149232937_country-music.jpg", # Country
+#         ]
         
-        genre_image_map = dict(zip(selected_genres, image_urls))
-        cloudinary_genre_image_map = {genre: upload_genres_image_to_cloudinary(image_url, genre_key=genre) for genre, image_url in genre_image_map.items()}
+#         genre_image_map = dict(zip(selected_genres, image_urls))
+#         cloudinary_genre_image_map = {genre: upload_genres_image_to_cloudinary(image_url, genre_key=genre) for genre, image_url in genre_image_map.items()}
         
-        for genre_name, image_url in cloudinary_genre_image_map.items():
-            genre = Genre(genre_name=genre_name, cloudinary_image_url=image_url)
-            db.session.add(genre)
+#         for genre_name, image_url in cloudinary_genre_image_map.items():
+#             genre = Genre(genre_name=genre_name, cloudinary_image_url=image_url)
+#             db.session.add(genre)
 
-        db.session.commit()
+#         db.session.commit()
 
-        return jsonify({'message': 'Genre data inserted successfully'})
-    except spotipy.SpotifyException as e:
-        return jsonify({'error': str(e)}), 500
+#         return jsonify({'message': 'Genre data inserted successfully'})
+#     except spotipy.SpotifyException as e:
+#         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/recommendation/genres')
+@cache.cached(timeout=3600) 
 def recommend_genres():
     genres = Genre.query.all()
     # Convert the list of Genre objects to a list of dictionaries
@@ -1235,6 +1194,7 @@ def fetch_tracks_by_genre(sp, genre_name):
     return formatted_tracks
 
 @app.route('/recommendation/genres/<path:genre_name>')
+@cache.cached(timeout=3600) 
 def recommend_genres_by_name(genre_name):
     access_token = redis.get('spotify_access_token').decode('utf-8') 
     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
@@ -1310,6 +1270,7 @@ def recommend_tracks_by_genre(genre):
     
 # ------------------- ARTIST ------------------------ #
 @app.route('/artist/<path:artist_id>')
+@cache.cached(timeout=3600) 
 def get_artist(artist_id):
     # Check if the artist is already in the database
     artist = Artist.query.filter_by(spotify_id=artist_id).first()
@@ -1656,6 +1617,8 @@ def refresh_spotify_token():
     socketio.emit('spotify_token_refreshed', {'spotify_access_token': token_info['access_token']})
 
     print("Token has been refreshed")
+    
+    return token_info['access_token']
         
 def check_token():
     if int(time.time()) > int(redis.get('expires_at') or 0) - 300:
@@ -1666,10 +1629,11 @@ def check_token():
 # Route for refreshing Spotify token
 @app.route('/spotify/refresh', methods=['POST'])
 def spotify_refresh():
-    refresh_spotify_token()
-    return jsonify({'message': 'Access token refreshed successfully'}), 200
+    access_token = refresh_spotify_token()
+    return jsonify({'message': 'Access token refreshed successfully', 'spotify_access_token' : access_token}), 200
 
 @app.route('/profile', methods=['GET'])
+@cache.cached(timeout=3600) 
 @jwt_required()
 def get_user_profile():
     current_user_id = get_jwt_identity()
