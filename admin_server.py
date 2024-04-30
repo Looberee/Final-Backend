@@ -23,6 +23,7 @@ from models.Room import Room
 from models.RefreshToken import RefreshToken
 from models.UserPreference import UserPreference
 from models.Track import Track
+from models.Artist import Artist
 from database import db
 from datetime import datetime, timedelta
 from werkzeug.middleware.profiler import ProfilerMiddleware
@@ -104,6 +105,18 @@ def get_all_tracks():
 
     # Return the tracks as JSON
     return jsonify(tracks_dict), 200
+
+@app.route('/artists')
+@jwt_required()
+def get_all_artists():
+    # Query the database for all artists
+    artists = Artist.query.all()
+
+    # Convert the artists to a list of dictionaries
+    artists_dict = [artist.to_dict() for artist in artists]
+
+    # Return the artists as JSON
+    return jsonify(artists_dict), 200
 
 @app.route('/users')
 @jwt_required()
@@ -207,19 +220,6 @@ def most_loved_tracks():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/admins')
-@jwt_required()
-def get_all_admins():
-    # Query the database for all admins
-    admins = Admin.query.all()
-
-    # Convert the admins to a list of dictionaries
-    admins_dict = [{'id': admin.id, 'name' : admin.name ,'username': admin.username, 'email': admin.email, 'date' : admin.date ,'priority': admin.priority} for admin in admins]
-
-    # Return the admins as JSON
-    return jsonify(admins_dict), 200
-
-
 @app.route('/profile')
 @jwt_required()
 def profile():
@@ -298,32 +298,6 @@ def login():
     set_refresh_cookies(resp, refresh_token)
     return resp, 200
 
-
-@app.route('/register', methods=['POST'])
-def register_admin():
-    # Get form data
-    name = request.json.get('name')
-    email = request.json.get('email')
-    username = request.json.get('username')
-    password = request.json.get('password')
-
-    # Check if any field is missing
-    if not (name and email and username and password):
-        return jsonify({"msg": "Missing required fields"}), 400
-
-    # Check if admin already exists
-    existing_admin = Admin.query.filter_by(username=username).first()
-    if existing_admin:
-        return jsonify({"msg": "Admin already exists"}), 400
-
-    # Create a new admin
-    new_admin = Admin(name=name, email=email, username=username, password=password, datetime=datetime.now(), priority=False)
-
-    # Add the new admin to the database
-    db.session.add(new_admin)
-    db.session.commit()
-
-    return jsonify({"msg": "Admin created successfully"}), 201
 
 @app.route('/logout', methods=['POST'])
 def logout():

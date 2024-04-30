@@ -35,6 +35,17 @@ class Artist(db.Model):
         self.followers = followers
         self.encode_id = self.encode_p_id()
         logger.info(f"Encoded ID generated for Artist '{self.name}': {self.encode_id}")
+        
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'spotify_id': self.spotify_id,
+            'name': self.name,
+            'cloudinary_artist_image_url': self.cloudinary_artist_image_url,
+            'genres': self.genres,
+            'followers': self.followers,
+            'encode_id': self.encode_id
+        }
 
 @listens_for(Artist, 'after_insert')
 def generate_encoded_id(mapper, connection, target):

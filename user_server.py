@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify, make_response, current_app, redirect, session, url_for, render_template
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
@@ -8,7 +10,6 @@ from flask_session import Session
 from flask_caching import Cache
 from flask_socketio import SocketIO, emit
 from flask_mail import Mail, Message
-from flask_restx import Api, Resource, fields
 from flask_redis import FlaskRedis
 
 
@@ -25,6 +26,7 @@ import atexit
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import desc
 from sqlalchemy import asc
+from sqlalchemy.sql.expression import func
 #End import Flask Database
 
 from models.User import User
@@ -99,7 +101,7 @@ login_manager.init_app(app)
 CORS(app, origins=["http://localhost:3000"], supports_credentials=True)  # Replace with your frontend URL
 socketio = SocketIO(app, cors_allowed_origins="*")
 redis = FlaskRedis(app)
-cache = Cache(app, config={'CACHE_TYPE': 'simple'})
+cache = Cache(app, config={'CACHE_TYPE': 'flask_caching.backends.SimpleCache'})
 
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:Delta1006@127.0.0.1/pyppo'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -135,6 +137,11 @@ migrate = Migrate(app, db)
 
 mail = Mail(app)
 # End init Mail
+
+limiter = Limiter(key_func=get_remote_address)
+limiter.init_app(app)
+
+
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -647,6 +654,7 @@ def add_personal_favourites_tracks():
     try:
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
         
         current_user_id = get_jwt_identity()
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
@@ -656,7 +664,6 @@ def add_personal_favourites_tracks():
             db.session.add(user_pref)
 
         spotify_id = request.json.get('spotify_id')  # Assuming you're sending track URI in the request
-
         # Check if track already exists
         track = Track.query.filter_by(spotify_id=spotify_id).first()
         if not track:
@@ -684,7 +691,8 @@ def add_personal_favourites_tracks():
 
         user_pref.favorite_tracks.append(track)
         db.session.commit()
-
+        
+        # check_favourite_track(track.id)
         return jsonify({'message': 'Track added to favorites successfully'})
         
     except Exception as e:
@@ -734,16 +742,12 @@ def delete_personal_favourites_track():
 @jwt_required()
 def check_favourite_track():
     current_user_id = get_jwt_identity()
-    track_id = request.json.get('track_id')
+    spotify_id = request.json.get('spotify_id')
+
     user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
     if user_pref:
-        if track_id:
-            is_favorite = any(track.id == track_id for track in user_pref.favorite_tracks)
-            return jsonify({'favourite' : is_favorite})
-        else:
-            spotify_id = request.json.get('spotify_id')
-            is_favorite = any(track.spotify_id == spotify_id for track in user_pref.favorite_tracks)
-            return jsonify({'favourite' : is_favorite})
+        is_favorite = any(track.spotify_id == spotify_id for track in user_pref.favorite_tracks)
+        return jsonify({'favourite' : is_favorite})
     else:
         return jsonify({'message': 'User preference not found'}), 404
     
@@ -785,7 +789,6 @@ def add_personal_favourite_artist():
     return jsonify({'message': 'Artist added to favorites successfully'})
 
 @app.route('/personal/favourites/artists', methods=['GET'])
-@cache.cached(timeout=3600) 
 @jwt_required()
 def get_personal_favourite_artists():
     current_user_id = get_jwt_identity()
@@ -801,6 +804,25 @@ def get_personal_favourite_artists():
                 'spotify_image_url': artist.cloudinary_artist_image_url,
                 'artist_id': artist.spotify_id,
                 'followers' : artist.followers
+            })
+        return jsonify({'favorite_artists': serialized_artists})
+    else:
+        return jsonify({'message': 'No favorite artists found'}), 404
+    
+@app.route('/personal/favourites/artists/random', methods=['GET'])
+@jwt_required()
+def get_random_artists():
+    current_user_id = get_jwt_identity()
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+
+    if user_pref:
+        random_artists = random.sample(user_pref.favorite_artists, min(5, len(user_pref.favorite_artists)))
+        serialized_artists = []
+        for artist in random_artists:
+            serialized_artists.append({
+                'name': artist.name,
+                'spotify_artist_image_url': artist.cloudinary_artist_image_url,
+                'artist_id': artist.spotify_id,
             })
         return jsonify({'favorite_artists': serialized_artists})
     else:
@@ -1220,7 +1242,7 @@ def fetch_artists_by_genre(sp, genre):
     sorted_artists = sorted(formatted_artists, key=lambda x: x['popularity'], reverse=True)[:6]
     return sorted_artists
 
-@app.route('/recommendation/artists/<genre>')
+@app.route('/recommendation/artists/<path:genre>')
 @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
 def recommend_artists_by_genre(genre):
     access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -1518,13 +1540,7 @@ def login():
     # Create a new access token with a 3-day expiry time
     access_token = create_access_token(identity=user.id, expires_delta=timedelta(days=3))
     
-    profile = {
-        'username': user.username,
-        'email': user.email,
-        'role': user.role
-    }
-
-    response = jsonify({'profile': profile, 'login': True, 'access_token': access_token, 'refresh_token': refresh_token, 'spotify_token' : redis.get('spotify_access_token').decode('utf-8')})
+    response = jsonify({'login': True, 'spotify_token' : redis.get('spotify_access_token').decode('utf-8'), 'spotify_expires_at': redis.get('expires_at').decode('utf-8')})
     set_access_cookies(response, access_token)
     set_refresh_cookies(response, refresh_token)
     
@@ -1618,7 +1634,7 @@ def refresh_spotify_token():
 
     print("Token has been refreshed")
     
-    return token_info['access_token']
+    return token_info['access_token'], expires_at
         
 def check_token():
     if int(time.time()) > int(redis.get('expires_at') or 0) - 300:
@@ -1629,11 +1645,18 @@ def check_token():
 # Route for refreshing Spotify token
 @app.route('/spotify/refresh', methods=['POST'])
 def spotify_refresh():
-    access_token = refresh_spotify_token()
-    return jsonify({'message': 'Access token refreshed successfully', 'spotify_access_token' : access_token}), 200
+    access_token, expires_at = refresh_spotify_token()
+
+    if expires_at is None:
+        # Handle the case where 'expires_at' is not in token_info
+        # For example, you might return an error message
+        return jsonify({'error': 'expires_at not found in token_info'})
+    
+    
+    return jsonify({'message': 'Access token refreshed successfully', 'spotify_token' : access_token, 'spotify_expires_at' : expires_at}), 200
 
 @app.route('/profile', methods=['GET'])
-@cache.cached(timeout=3600) 
+# @limiter.limit("3/minute")
 @jwt_required()
 def get_user_profile():
     current_user_id = get_jwt_identity()
@@ -1745,6 +1768,8 @@ def healthcheck():
     except Exception as e:
         # If an error occurred, return a 500 status code and the error message
         return jsonify({"status": "Error", "message": str(e)}), 500
+    
+
     
 # @app.route('/api')
 # def redirect_to_swagger():

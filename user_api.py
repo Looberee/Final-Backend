@@ -980,5 +980,601 @@ def fetch_tracks_by_genre(sp, genre_name):
         formatted_tracks.append(formatted_track)
     return formatted_tracks
 
+@api.route('/recommendation/artists/<genre>')
+class RecommendArtistsByGenre(Resource):
+    @jwt_required()
+    @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
+    def get(self, genre):
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
+        try:
+            sorted_artists = fetch_artists_by_genre(sp, genre)
+            return jsonify({'sorted_artists': sorted_artists})
+        except spotipy.SpotifyException as e:
+            return jsonify({'error': str(e)})
+
+
+@api.route('/recommendation/tracks/<path:genre>')
+class RecommendTracksByGenre(Resource):
+    @jwt_required()
+    @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
+    def get(self, genre):
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                sorted_tracks = executor.submit(fetch_tracks_by_specific_genre, sp, genre).result()
+            return jsonify({'sorted_tracks': sorted_tracks})
+        except spotipy.SpotifyException as e:
+            return jsonify({'error': str(e)})
+        
+def fetch_tracks_by_specific_genre(sp, genre):
+    results = sp.search(q=f'genre:"{genre}"', type='track', limit=12)
+    tracks_info = results['tracks']['items']
+    formatted_tracks = []
+    for track_info in tracks_info:
+        artists = ", ".join([artist['name'] for artist in track_info['artists']])
+        album_info = track_info['album']
+        album_images = album_info['images']
+        album_image_url = album_images[0]['url'] if album_images else None
+        formatted_track = {
+            "name": track_info["name"],
+            "artists": artists,
+            "duration": track_info["duration_ms"],
+            "spotify_id": track_info["id"],
+            "popularity": track_info["popularity"],
+            "spotify_image_url": album_image_url
+        }
+        formatted_tracks.append(formatted_track)
+    sorted_tracks = sorted(formatted_tracks, key=lambda x: x['popularity'], reverse=True)[:6]
+    return sorted_tracks
+
+def fetch_artists_by_genre(sp, genre):
+    artists_info = sp.search(q=f'genre:"{genre}"', type='artist', limit=20)['artists']['items']
+    formatted_artists = []
+    for artist_info in artists_info:
+        formatted_artist = {
+            "name": artist_info["name"],
+            "artist_id": artist_info["id"],
+            "popularity": artist_info["popularity"],
+            "spotify_image_url": artist_info["images"][0]["url"] if artist_info["images"] else None
+        }
+        formatted_artists.append(formatted_artist)
+    sorted_artists = sorted(formatted_artists, key=lambda x: x['popularity'], reverse=True)[:6]
+    return sorted_artists
+
+@api.route('/artist/<path:artist_id>')
+class Artist(Resource):
+    @cache.cached(timeout=3600)
+    def get(self, artist_id):
+        # Check if the artist is already in the database
+        artist = Artist.query.filter_by(spotify_id=artist_id).first()
+
+        if artist:
+            # If the artist is found in the database, return the stored information
+            return jsonify({
+                'name': artist.name,
+                'image': artist.cloudinary_artist_image_url,
+                'genres': artist.genres,
+                'followers': artist.followers
+            })
+        else:
+            # If the artist is not found in the database, fetch the information from the Spotify API
+            access_token = redis.get('spotify_access_token').decode('utf-8')
+            sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
+            artist_info = sp.artist(artist_id)
+            artist_name = artist_info['name']
+            artist_image = artist_info['images'][0]['url'] if artist_info['images'] else None
+            artist_genres = artist_info['genres']
+            artist_followers = artist_info['followers']['total']
+
+            # Insert the artist information into the database
+            new_artist = Artist(spotify_id=artist_id, name=artist_name, cloudinary_artist_image_url=upload_image_to_cloudinary(artist_image), genres=', '.join(artist_genres), followers=artist_followers)
+            db.session.add(new_artist)
+            db.session.commit()
+
+            # Return the fetched information
+            return jsonify({
+                'name': artist_name,
+                'image': artist_image,
+                'genres': artist_genres,
+                'followers': artist_followers
+            })
+            
+def fetch_artist_top_tracks(sp, artist_ids):
+    # Create a ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Use list comprehension to create a list of futures
+        futures = [executor.submit(fetch_top_tracks_for_artist, sp, artist_id) for artist_id in artist_ids]
+
+        # Gather the results as they become available
+        tracks = []
+        for future in concurrent.futures.as_completed(futures):
+            tracks.extend(future.result())
+
+    return jsonify(tracks)
+
+def fetch_top_tracks_for_artist(sp, artist_id):
+    # Create a new Spotify object inside this function
+    access_token = redis.get('spotify_access_token').decode('utf-8')
+    sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+    
+    top_tracks = sp.artist_top_tracks(artist_id)
+
+    # Get artist name
+    artist_info = sp.artist(artist_id)
+    artist_name = artist_info['name']
+    
+    # Extract track information
+    tracks = []
+    for track in top_tracks['tracks']:
+        tracks.append({
+            "name": track["name"],
+            "duration": track["duration_ms"],
+            "spotify_id": track["id"],
+            "popularity": track["popularity"],
+            "spotify_image_url": track["album"]["images"][0]["url"],
+            "artists": artist_name
+        })
+
+    # Return only the first 6 tracks
+    return tracks[:6]
+
+@api.route('/artist/<path:artist_id>/top-tracks')
+class TopTracks(Resource):
+    @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
+    def get(self, artist_id):
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+        return fetch_artist_top_tracks(sp, [artist_id])
+    
+@api.route('/paypal/payment/capture')
+class PayPalPaymentCapture(Resource):
+    @jwt_required()
+    def post(self):
+        data = request.json
+        user_id = get_jwt_identity()  # Get the user ID from the JWT
+
+        # Extract the relevant information from the data
+        transaction_id = data['id']
+        amount = float(data['purchase_units'][0]['amount']['value'])
+        currency = data['purchase_units'][0]['amount']['currency_code']
+        status = data['status']
+        email = data['payer']['email_address'] 
+        
+        # Create a new Payment object
+        payment = Payment(user_id, transaction_id, amount, currency, status, email)
+        
+        # Add the payment to the database and commit the transaction
+        db.session.add(payment)
+        db.session.commit()
+        
+        # Upgrade the user to premium
+        upgrade_to_premium(user_id)
+        
+        # Return a JSON response with the captured data
+        return jsonify({"payload" : data}), 200
+    
+@api.route('/callback')
+class Callback(Resource):
+    def get(self):
+        """
+        Callback Endpoint.
+
+        This endpoint handles the callback from the Spotify authorization process.
+        """
+        code = request.args.get('code')
+        if not code:
+            return {'message': 'Authorization code is missing'}, 400
+        else:
+            # Call the get_access_token function with the authorization code
+            return get_access_token(code)
+
+@api.route('/authorization')
+class Authorization(Resource):
+    def get(self):
+        """
+        Authorization Endpoint.
+
+        This endpoint redirects users to the Spotify authorization page.
+        """
+        return spotify_authorization()
+
+def spotify_authorization():
+    authorization_params = {
+        'client_id': sp_oauth.client_id,
+        'response_type': 'code',
+        'redirect_uri': sp_oauth.redirect_uri,
+        'scope': sp_oauth.scope,
+    }
+
+    # Create the authorization URL
+    authorization_url = "https://accounts.spotify.com/authorize?" + urlencode(authorization_params)
+
+    # Redirect the user to the Spotify login page
+    return redirect(authorization_url)
+
+@api.route('/get-access-token')
+class GetAccessToken(Resource):
+    def post(self):
+        """
+        Get Access Token.
+        
+        This endpoint retrieves an access token from Spotify using the provided authorization code.
+        """
+        data = request.json
+        code = data.get('code')
+        if not code:
+            return {'error': 'Authorization code is missing'}, 400
+
+        token_info = self._get_access_token(code)
+        return token_info
+
+    def _get_access_token(self, code):
+        token_url = 'https://accounts.spotify.com/api/token'
+
+        # Encode client_id and client_secret to Base64
+        client_credentials = f"{sp_oauth.client_id}:{sp_oauth.client_secret}"
+        base64_credentials = b64encode(client_credentials.encode()).decode()
+
+        # Prepare the request body
+        token_params = {
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': sp_oauth.redirect_uri
+        }
+
+        # Prepare the request headers
+        headers = {
+            'Authorization': f"Basic {base64_credentials}",
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+
+        try:
+            # Make a POST request to the Spotify API
+            response = requests.post(token_url, data=token_params, headers=headers)
+            response.raise_for_status()  # Check for HTTP errors
+
+            token_info = response.json()
+
+            # Check if 'access_token' exists in token_info
+            if 'access_token' in token_info:
+                redis.set('spotify_access_token', token_info['access_token'])
+                redis.set('spotify_refresh_token', token_info['refresh_token'])
+            return token_info
+        except requests.exceptions.RequestException as e:
+            return {'error': str(e)}, 500  # Return an error response
+        
+@api.route('/login')
+class Login(Resource):
+    def post(self):
+        """
+        Login User.
+        
+        This endpoint logs in a user with the provided username and password, and returns an access token.
+        """
+        username = request.json.get('username')
+        password = request.json.get('password')
+
+        if not username or not password:
+            return {'error': 'Username and password required'}, 400
+
+        user = User.query.filter_by(username=username).first()
+
+        if not user or not check_password_hash(user.password_hash, password):
+            return {'error': 'Invalid username or password'}, 401
+
+        existing_refresh_token = RefreshToken.query.filter_by(user_id=user.id).first()
+
+        if existing_refresh_token:
+            refresh_token = existing_refresh_token.jti
+        else:
+            refresh_token = create_refresh_token(identity=user.id)
+            insert_refresh_token(refresh_token, user.id)
+
+        access_token = create_access_token(identity=user.id, expires_delta=timedelta(days=3))
+
+        profile = {
+            'username': user.username,
+            'email': user.email,
+            'role': user.role
+        }
+
+        response = {'profile': profile, 'login': True, 'access_token': access_token, 'refresh_token': refresh_token, 'spotify_token': redis.get('spotify_access_token').decode('utf-8')}
+        set_access_cookies(response, access_token)
+        set_refresh_cookies(response, refresh_token)
+
+        return response, 200
+
+@api.route('/check-auth')
+class CheckAuth(Resource):
+    def get(self):
+        """
+        Check Authentication.
+        
+        This endpoint checks if the user is authenticated.
+        """
+        try:
+            verify_jwt_in_request()
+            return {'isAuthenticated': True}, 200
+        except:
+            return {'isAuthenticated': False}, 401
+
+@api.route('/register')
+class Register(Resource):
+    def post(self):
+        """
+        Register User.
+        
+        This endpoint registers a new user with the provided username, email, and password.
+        """
+        data = request.json
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+
+        existing_user = User.query.filter_by(username=username).first()
+
+        if existing_user:
+            return {'message': 'Username already exists'}, 400
+
+        new_user = User(username=username, email=email, password=password)
+        db.session.add(new_user)
+        db.session.commit()
+        return {'message': 'Registration successful'}, 201
+    
+@app.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True)
+def refresh():
+    # Get the current user's ID
+    current_user_id = get_jwt_identity()
+
+    # Get the JTI of the current refresh token
+    current_jti = get_jwt()["jti"]
+
+    # Check if the refresh token is in the database and not revoked
+    token_in_db = RefreshToken.query.filter_by(user_id=current_user_id, jti=current_jti, revoked=False).first()
+    if token_in_db is None:
+        return {"msg": "Refresh token not found in database"}, 401
+
+    # Create a new access token
+    new_access_token = create_access_token(identity=current_user_id)
+    refresh_token = token_in_db.token
+
+    # Return the new access token and the refresh token
+    return {"access_token": new_access_token, "refresh_token": refresh_token}, 200
+
+def refresh_spotify_token():
+    
+    refresh_token = redis.get('spotify_refresh_token').decode('utf-8')
+    if not refresh_token:
+        return jsonify({'error': 'Refresh token is missing'}), 400
+
+    # Your Spotify app's client ID and client secret
+    client_id = sp_oauth.client_id  # Replace with your client ID
+    client_secret = sp_oauth.client_secret  # Replace with your client secret
+
+    # Prepare the headers
+    credentials = f'{client_id}:{client_secret}'
+    encoded_credentials = b64encode(credentials.encode('utf-8')).decode('utf-8')
+    headers = {
+        'Authorization': f'Basic {encoded_credentials}',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+    body = {
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token
+    }
+
+    # Make a POST request to the Spotify API
+    response = requests.post('https://accounts.spotify.com/api/token', headers=headers, data=body)
+    response.raise_for_status()  # Raise an exception if the request failed
+
+    # Store the new access token and its expiration time in Redis
+    token_info = response.json()
+    redis.set('spotify_access_token', token_info['access_token'])
+    expires_at = int(time.time()) + token_info['expires_in']
+    redis.set('expires_at', expires_at)
+
+    socketio.emit('spotify_token_refreshed', {'spotify_access_token': token_info['access_token']})
+
+    print("Token has been refreshed")
+    
+    return token_info['access_token']
+        
+def check_token():
+    if int(time.time()) > int(redis.get('expires_at') or 0) - 300:
+        refresh_spotify_token()
+        print("Token will expire in 5 minutes, force refresh now")
+    
+
+# Route for refreshing Spotify token
+@app.route('/spotify/refresh', methods=['POST'])
+def spotify_refresh():
+    access_token = refresh_spotify_token()
+    return jsonify({'message': 'Access token refreshed successfully', 'spotify_access_token' : access_token}), 200
+
+@app.route('/profile', methods=['GET'])
+@cache.cached(timeout=3600) 
+@jwt_required()
+def get_user_profile():
+    current_user_id = get_jwt_identity()
+    user = db.session.get(User, current_user_id)
+    if not user:
+        return jsonify({'message': 'User not found'}), 404
+    profile_data = {
+        'id': current_user_id,
+        'username': user.username,
+        'role' : user.role,
+    }
+    return jsonify({"profile" : profile_data}), 200
+
+
+@app.route('/logout')
+@jwt_required()
+def logout():
+    # Create the response object
+    response = make_response(jsonify({'message': 'User logged out'}))
+    unset_jwt_cookies(response)
+    return response, 200
+
+class EmailResource(Resource):
+    def post(self):
+        """
+        Send Email.
+        
+        This endpoint sends an email using SMTP with the provided parameters.
+        """
+        data = request.json
+        sender_email = data.get('sender_email')
+        sender_password = data.get('sender_password')
+        recipient_email = data.get('recipient_email')
+        subject = data.get('subject')
+        template_name = data.get('template_name')
+        template_vars = data.get('template_vars')
+
+        try:
+            send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars)
+            return {'message': 'Email sent successfully'}, 200
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+    def send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars):
+        try:
+            smtp_server = 'smtp.gmail.com'
+            smtp_port = 587
+
+            server = smtplib.SMTP(smtp_server, smtp_port)
+            server.starttls()
+            server.login(sender_email, sender_password)
+
+            msg = MIMEMultipart()
+            msg['From'] = 'Pyppo The Final'
+            msg['To'] = recipient_email
+            msg['Subject'] = subject
+
+            html_content = render_template(template_name, **template_vars)
+
+            msg.attach(MIMEText(html_content, 'html'))
+
+            server.sendmail(sender_email, recipient_email, msg.as_string())
+            server.quit()
+
+        except smtplib.SMTPAuthenticationError as e:
+            raise Exception("SMTP Authentication Error: Check if username and password are correct.")
+        except Exception as e:
+            raise Exception("An error occurred: Please check your SMTP server settings and try again.")
+
+@api.route('/email')
+class EmailAPI(Resource):
+    def post(self):
+        """
+        Send Email.
+        
+        This endpoint sends an email using SMTP with the provided parameters.
+        """
+        data = request.json
+        sender_email = data.get('sender_email')
+        sender_password = data.get('sender_password')
+        recipient_email = data.get('recipient_email')
+        subject = data.get('subject')
+        template_name = data.get('template_name')
+        template_vars = data.get('template_vars')
+
+        try:
+            send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars)
+            return {'message': 'Email sent successfully'}, 200
+        except Exception as e:
+            return {'error': str(e)}, 500
+        
+def upload_image_to_cloudinary(image_url):
+    try:
+        # Upload image to Cloudinary
+        response = cloudinary.uploader.upload(image_url)
+        return response['secure_url']  # Return the Cloudinary image URL
+    except Exception as e:
+        print(f"Error uploading image to Cloudinary: {e}")
+        return None
+    
+def upload_genres_image_to_cloudinary(image_url, genre_key):
+    try:
+        # Upload image to Cloudinary
+        response = cloudinary.uploader.upload(image_url, public_id=genre_key)
+        return response['secure_url']  # Return the Cloudinary image URL
+    except Exception as e:
+        print(f"Error uploading image to Cloudinary: {e}")
+        return None
+    
+def send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars):
+    try:
+        # SMTP Configuration
+        smtp_server = 'smtp.gmail.com'
+        smtp_port = 587
+
+        # Create SMTP object
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()  # Start TLS encryption
+        server.login(sender_email, sender_password)
+
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = 'Pyppo The Final'
+        msg['To'] = recipient_email
+        msg['Subject'] = subject
+
+        # Render HTML template
+        html_content = render_template(template_name, **template_vars)
+
+        # Attach HTML content
+        msg.attach(MIMEText(html_content, 'html'))
+
+        # Send email
+        server.sendmail(sender_email, recipient_email, msg.as_string())
+        print("Email sent successfully!")
+        server.quit()
+
+    except smtplib.SMTPAuthenticationError as e:
+        print("SMTP Authentication Error:", e)
+        print("Check if username and password are correct.")
+        print("Also, ensure that you're not using 2-step verification.")
+    except Exception as e:
+        print("An error occurred:", e)
+        print("Please check your SMTP server settings and try again.")
+
+subject = 'Test Email'
+message = 'This is a test email sent using Python.'
+
+def upgrade_to_premium(user_id):
+    user = User.query.get(user_id)
+    user.role = 'premium'
+    db.session.commit()
+    return jsonify({'message': 'User upgraded to premium successfully'}), 200
+
+from sqlalchemy import exc
+
+class HealthCheck(Resource):
+    def get(self):
+        """
+        Health Check
+        
+        Check the health status of the application.
+        """
+        try:
+            # Try to query the database
+            db.session.query("1").from_statement("SELECT 1").all()
+            return {"status": "OK"}, 200
+        except exc.SQLAlchemyError as e:
+            # If an error occurred with the database, return a 500 status code and the error message
+            return {"status": "Error", "message": str(e)}, 500
+        except Exception as e:
+            # For other exceptions, return a 500 status code and the error message
+            return {"status": "Error", "message": str(e)}, 500
+
+api.add_resource(HealthCheck, '/healthcheck')
+
 if __name__ == "__main__":
     app.run(debug=True, port=5003)
