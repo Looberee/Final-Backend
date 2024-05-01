@@ -138,7 +138,7 @@ migrate = Migrate(app, db)
 mail = Mail(app)
 # End init Mail
 
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=get_remote_address, storage_uri="redis://:Delta1006@localhost:6379/0")
 limiter.init_app(app)
 
 
@@ -1433,13 +1433,27 @@ def paypal_capture():
     amount = float(data['purchase_units'][0]['amount']['value'])
     currency = data['purchase_units'][0]['amount']['currency_code']
     status = data['status']
-    email = data['payer']['email_address'] 
-    
-    payment = Payment(user_id, transaction_id, amount, currency, status, email)
-    
+    payment_email = data['payer']['email_address'] 
+
+    # Fetch the user's email from the database
+    user = User.query.get(user_id)
+    user_email = user.email if user else None
+
+    payment = Payment(user_id, transaction_id, amount, currency, status, payment_email)
+
     db.session.add(payment)
     db.session.commit()
     upgrade_to_premium(user_id)
+
+    # Send email(s)
+    if user_email == payment_email:
+        send_email(user_email, "Payment Confirmation", "Your payment was successful.")
+    else:
+        if user_email:
+            send_email(user_email)
+        send_email(payment_email)
+        send_email(user_email)
+
     return jsonify({"payload" : data}), 200
 
 # --------------------------- CALLBACK --------------------------- #    
@@ -1666,9 +1680,41 @@ def get_user_profile():
     profile_data = {
         'id': current_user_id,
         'username': user.username,
+        'email' : user.email,
         'role' : user.role,
     }
     return jsonify({"profile" : profile_data}), 200
+
+@app.route('/profile', methods=['PUT'])
+@jwt_required()
+def edit_profile():
+    current_user_id = get_jwt_identity()
+    current_user = db.session.get(User, current_user_id)
+    if not current_user:
+        return jsonify({'message': 'User not found'}), 404
+
+    data = request.get_json()
+    username = data.get('username')
+    email = data.get('email')
+
+    if username:
+        user_with_same_username = User.query.filter_by(username=username).first()
+        if user_with_same_username and user_with_same_username.id != current_user_id:
+            return jsonify({'exists_name': True}), 200
+
+    if email:
+        user_with_same_email = User.query.filter_by(email=email).first()
+        if user_with_same_email and user_with_same_email.id != current_user_id:
+            return jsonify({'exists_email': True}), 200
+
+    if 'username' in data:
+        current_user.username = data['username']
+    if 'email' in data:
+        current_user.email = data['email']
+
+    db.session.commit()
+
+    return jsonify({'message': 'Profile updated successfully'}), 200
 
 
 @app.route('/logout')
@@ -1698,7 +1744,7 @@ def upload_genres_image_to_cloudinary(image_url, genre_key):
         print(f"Error uploading image to Cloudinary: {e}")
         return None
     
-def send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars):
+def send_email(recipient_email):
     try:
         # SMTP Configuration
         smtp_server = 'smtp.gmail.com'
@@ -1707,22 +1753,22 @@ def send_email(sender_email, sender_password, recipient_email, subject, template
         # Create SMTP object
         server = smtplib.SMTP(smtp_server, smtp_port)
         server.starttls()  # Start TLS encryption
-        server.login(sender_email, sender_password)
+        server.login('dennisofcetus98@gmail.com','yuqm gfyd zdmi pjmg')
 
         # Create message
         msg = MIMEMultipart()
         msg['From'] = 'Pyppo The Final'
         msg['To'] = recipient_email
-        msg['Subject'] = subject
+        msg['Subject'] = 'Thank you for your subcribtion for Pyppo'
 
         # Render HTML template
-        html_content = render_template(template_name, **template_vars)
+        html_content = render_template('thank_mail.html')
 
         # Attach HTML content
         msg.attach(MIMEText(html_content, 'html'))
 
         # Send email
-        server.sendmail(sender_email, recipient_email, msg.as_string())
+        server.sendmail('dennisofcetus98@gmail.com', recipient_email, msg.as_string())
         print("Email sent successfully!")
         server.quit()
 
@@ -1734,7 +1780,7 @@ def send_email(sender_email, sender_password, recipient_email, subject, template
         print("An error occurred:", e)
         print("Please check your SMTP server settings and try again.")
 
-subject = 'Test Email'
+
 message = 'This is a test email sent using Python.'
 
 def upgrade_to_premium(user_id):
@@ -1745,7 +1791,7 @@ def upgrade_to_premium(user_id):
     
 @app.route('/send-mail')
 def send_thanks_mail():
-    send_email('dennisofcetus98@gmail.com', 'yuqm gfyd zdmi pjmg', 'delta06coder@gmail.com', subject=subject, template_name='thank_mail.html', name='John', age=30)
+    send_email('delta06coder@gmail.com')
     return "Email sent successfully"
 
 scheduler = BackgroundScheduler()
