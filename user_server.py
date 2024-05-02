@@ -1791,7 +1791,7 @@ def upgrade_to_premium(user_id):
     
 @app.route('/send-mail')
 def send_thanks_mail():
-    send_email('delta06coder@gmail.com')
+    send_email('nguyenhuuhieu304@gmail.com')
     return "Email sent successfully"
 
 scheduler = BackgroundScheduler()
