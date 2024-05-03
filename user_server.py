@@ -50,6 +50,8 @@ import aiohttp
 
 import smtplib
 
+from itsdangerous import URLSafeTimedSerializer
+
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -805,9 +807,9 @@ def get_personal_favourite_artists():
                 'artist_id': artist.spotify_id,
                 'followers' : artist.followers
             })
-        return jsonify({'favorite_artists': serialized_artists})
+        return jsonify({'favourite_artists': serialized_artists})
     else:
-        return jsonify({'message': 'No favorite artists found'}), 404
+        return jsonify({'message': 'No favourite artists found'}), 404
     
 @app.route('/personal/favourites/artists/random', methods=['GET'])
 @jwt_required()
@@ -1715,6 +1717,50 @@ def edit_profile():
     db.session.commit()
 
     return jsonify({'message': 'Profile updated successfully'}), 200
+
+@app.route('/request-reset', methods=['POST'])
+def request_reset():
+    data = request.get_json()
+    email = data.get('email')
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({'message': 'Email not found'}), 404
+
+    # Generate a unique token for this user
+    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+    token = s.dumps(user.id)
+
+    # Generate a URL for the reset page, including the token as a parameter
+    reset_url = url_for('reset_password', token=token, _external=True)
+
+    # Send the user an email with the reset link
+    send_email(email, 'Password Reset Request', 'Click this link to reset your password: ' + reset_url)
+
+    return jsonify({'message': 'Password reset email sent'}), 200
+
+@app.route('/personal/reset-password/<token>', methods=['POST'])
+def reset_password(token):
+    data = request.get_json()
+    new_password = data.get('password')
+
+    # Decode the token to get the user ID
+    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+    try:
+        user_id = s.loads(token, max_age=3600)  # Token is valid for 1 hour
+    except:
+        return jsonify({'message': 'Invalid or expired token'}), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'message': 'User not found'}), 404
+
+    # Hash the new password and update the user's password
+    user.password = generate_password_hash(new_password)
+
+    db.session.commit()
+
+    return jsonify({'message': 'Password updated successfully'}), 200
 
 
 @app.route('/logout')
