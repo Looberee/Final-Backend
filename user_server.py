@@ -11,10 +11,13 @@ from flask_caching import Cache
 from flask_socketio import SocketIO, emit
 from flask_mail import Mail, Message
 from flask_redis import FlaskRedis
+from flask import render_template_string
 
 
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
 
 import random
@@ -77,7 +80,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import cached_property
 #End import werkzeug
 
-
+from requests.exceptions import ReadTimeout
 
 import base64
 import requests
@@ -1731,13 +1734,32 @@ def request_reset():
     s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
     token = s.dumps(user.id)
 
-    # Generate a URL for the reset page, including the token as a parameter
-    reset_url = url_for('reset_password', token=token, _external=True)
+    # Manually construct the URL for the reset page, using the load balancer's address and port
+    reset_url = 'http://127.0.0.1:5000/confirm-email/' + token
 
     # Send the user an email with the reset link
-    send_email(email, 'Password Reset Request', 'Click this link to reset your password: ' + reset_url)
+    send_reset_email(email, 'Password Reset Request', 'Click this link to reset your password: ' + reset_url)
 
     return jsonify({'message': 'Password reset email sent'}), 200
+
+@app.route('/confirm-email/<token>', methods=['GET'])
+def confirm_email(token):
+    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+    try:
+        user_id = s.loads(token, max_age=3600)
+    except SignatureExpired:
+        return jsonify({'message': 'The confirmation link is expired.'}), 400
+    except BadTimeSignature:
+        return jsonify({'message': 'The confirmation link is invalid.'}), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'message': 'User not found'}), 404
+
+    user.email_confirmed = True
+    db.session.commit()
+
+    return jsonify({'message': 'Email confirmed successfully'}), 200
 
 @app.route('/personal/reset-password/<token>', methods=['POST'])
 def reset_password(token):
@@ -1828,6 +1850,42 @@ def send_email(recipient_email):
 
 
 message = 'This is a test email sent using Python.'
+
+def send_reset_email(recipient_email, subject, reset_url):
+    try:
+        # SMTP Configuration
+        smtp_server = 'smtp.gmail.com'
+        smtp_port = 587
+
+        # Create SMTP object
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()  # Start TLS encryption
+        server.login('dennisofcetus98@gmail.com','yuqm gfyd zdmi pjmg')
+
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = 'Pyppo The Final'
+        msg['To'] = recipient_email
+        msg['Subject'] = subject
+
+        # Create reset password message
+        message = 'Click this link to reset your password: ' + reset_url
+
+        # Attach message content
+        msg.attach(MIMEText(message, 'html'))
+
+        # Send email
+        server.sendmail('dennisofcetus98@gmail.com', recipient_email, msg.as_string())
+        print("Email sent successfully!")
+        server.quit()
+
+    except smtplib.SMTPAuthenticationError as e:
+        print("SMTP Authentication Error:", e)
+        print("Check if username and password are correct.")
+        print("Also, ensure that you're not using 2-step verification.")
+    except Exception as e:
+        print("An error occurred:", e)
+        print("Please check your SMTP server settings and try again.")
 
 def upgrade_to_premium(user_id):
     user = User.query.get(user_id)

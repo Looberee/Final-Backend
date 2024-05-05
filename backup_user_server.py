@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify, make_response, current_app, redirect, session, url_for, render_template
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
@@ -8,7 +10,6 @@ from flask_session import Session
 from flask_caching import Cache
 from flask_socketio import SocketIO, emit
 from flask_mail import Mail, Message
-from flask_restx import Api, Resource, fields
 from flask_redis import FlaskRedis
 
 
@@ -25,6 +26,7 @@ import atexit
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import desc
 from sqlalchemy import asc
+from sqlalchemy.sql.expression import func
 #End import Flask Database
 
 from models.User import User
@@ -47,6 +49,8 @@ import asyncio
 import aiohttp
 
 import smtplib
+
+from itsdangerous import URLSafeTimedSerializer
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -99,7 +103,7 @@ login_manager.init_app(app)
 CORS(app, origins=["http://localhost:3000"], supports_credentials=True)  # Replace with your frontend URL
 socketio = SocketIO(app, cors_allowed_origins="*")
 redis = FlaskRedis(app)
-cache = Cache(app, config={'CACHE_TYPE': 'simple'})
+cache = Cache(app, config={'CACHE_TYPE': 'flask_caching.backends.SimpleCache'})
 
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:Delta1006@127.0.0.1/pyppo'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -135,6 +139,11 @@ migrate = Migrate(app, db)
 
 mail = Mail(app)
 # End init Mail
+
+limiter = Limiter(key_func=get_remote_address, storage_uri="redis://:Delta1006@localhost:6379/0")
+limiter.init_app(app)
+
+
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -647,6 +656,7 @@ def add_personal_favourites_tracks():
     try:
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+
         
         current_user_id = get_jwt_identity()
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
@@ -656,7 +666,6 @@ def add_personal_favourites_tracks():
             db.session.add(user_pref)
 
         spotify_id = request.json.get('spotify_id')  # Assuming you're sending track URI in the request
-
         # Check if track already exists
         track = Track.query.filter_by(spotify_id=spotify_id).first()
         if not track:
@@ -684,7 +693,8 @@ def add_personal_favourites_tracks():
 
         user_pref.favorite_tracks.append(track)
         db.session.commit()
-
+        
+        # check_favourite_track(track.id)
         return jsonify({'message': 'Track added to favorites successfully'})
         
     except Exception as e:
@@ -734,16 +744,12 @@ def delete_personal_favourites_track():
 @jwt_required()
 def check_favourite_track():
     current_user_id = get_jwt_identity()
-    track_id = request.json.get('track_id')
+    spotify_id = request.json.get('spotify_id')
+
     user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
     if user_pref:
-        if track_id:
-            is_favorite = any(track.id == track_id for track in user_pref.favorite_tracks)
-            return jsonify({'favourite' : is_favorite})
-        else:
-            spotify_id = request.json.get('spotify_id')
-            is_favorite = any(track.spotify_id == spotify_id for track in user_pref.favorite_tracks)
-            return jsonify({'favourite' : is_favorite})
+        is_favorite = any(track.spotify_id == spotify_id for track in user_pref.favorite_tracks)
+        return jsonify({'favourite' : is_favorite})
     else:
         return jsonify({'message': 'User preference not found'}), 404
     
@@ -785,7 +791,6 @@ def add_personal_favourite_artist():
     return jsonify({'message': 'Artist added to favorites successfully'})
 
 @app.route('/personal/favourites/artists', methods=['GET'])
-@cache.cached(timeout=3600) 
 @jwt_required()
 def get_personal_favourite_artists():
     current_user_id = get_jwt_identity()
@@ -801,6 +806,25 @@ def get_personal_favourite_artists():
                 'spotify_image_url': artist.cloudinary_artist_image_url,
                 'artist_id': artist.spotify_id,
                 'followers' : artist.followers
+            })
+        return jsonify({'favourite_artists': serialized_artists})
+    else:
+        return jsonify({'message': 'No favourite artists found'}), 404
+    
+@app.route('/personal/favourites/artists/random', methods=['GET'])
+@jwt_required()
+def get_random_artists():
+    current_user_id = get_jwt_identity()
+    user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
+
+    if user_pref:
+        random_artists = random.sample(user_pref.favorite_artists, min(5, len(user_pref.favorite_artists)))
+        serialized_artists = []
+        for artist in random_artists:
+            serialized_artists.append({
+                'name': artist.name,
+                'spotify_artist_image_url': artist.cloudinary_artist_image_url,
+                'artist_id': artist.spotify_id,
             })
         return jsonify({'favorite_artists': serialized_artists})
     else:
@@ -1034,6 +1058,7 @@ def toggle_repeat():
 def seek():
     data = request.json
     new_position_ms_str = data.get('newPositionMs')
+    isPlaying = data.get('isPlaying')
     if new_position_ms_str is not None:
         new_position_ms = int(new_position_ms_str)
         access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -1047,8 +1072,8 @@ def seek():
                 # Temporarily disable repeat mode
                 sp.repeat('off')
 
-            # Seek to the new position
-            sp.seek_track(new_position_ms)
+            if (isPlaying):
+                sp.seek_track(new_position_ms)
 
             # Re-enable repeat mode if it was active
             if playback_info['repeat_state'] != 'off':
@@ -1220,7 +1245,7 @@ def fetch_artists_by_genre(sp, genre):
     sorted_artists = sorted(formatted_artists, key=lambda x: x['popularity'], reverse=True)[:6]
     return sorted_artists
 
-@app.route('/recommendation/artists/<genre>')
+@app.route('/recommendation/artists/<path:genre>')
 @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
 def recommend_artists_by_genre(genre):
     access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -1411,13 +1436,27 @@ def paypal_capture():
     amount = float(data['purchase_units'][0]['amount']['value'])
     currency = data['purchase_units'][0]['amount']['currency_code']
     status = data['status']
-    email = data['payer']['email_address'] 
-    
-    payment = Payment(user_id, transaction_id, amount, currency, status, email)
-    
+    payment_email = data['payer']['email_address'] 
+
+    # Fetch the user's email from the database
+    user = User.query.get(user_id)
+    user_email = user.email if user else None
+
+    payment = Payment(user_id, transaction_id, amount, currency, status, payment_email)
+
     db.session.add(payment)
     db.session.commit()
     upgrade_to_premium(user_id)
+
+    # Send email(s)
+    if user_email == payment_email:
+        send_email(user_email, "Payment Confirmation", "Your payment was successful.")
+    else:
+        if user_email:
+            send_email(user_email)
+        send_email(payment_email)
+        send_email(user_email)
+
     return jsonify({"payload" : data}), 200
 
 # --------------------------- CALLBACK --------------------------- #    
@@ -1518,13 +1557,7 @@ def login():
     # Create a new access token with a 3-day expiry time
     access_token = create_access_token(identity=user.id, expires_delta=timedelta(days=3))
     
-    profile = {
-        'username': user.username,
-        'email': user.email,
-        'role': user.role
-    }
-
-    response = jsonify({'profile': profile, 'login': True, 'access_token': access_token, 'refresh_token': refresh_token, 'spotify_token' : redis.get('spotify_access_token').decode('utf-8')})
+    response = jsonify({'login': True, 'spotify_token' : redis.get('spotify_access_token').decode('utf-8'), 'spotify_expires_at': redis.get('expires_at').decode('utf-8')})
     set_access_cookies(response, access_token)
     set_refresh_cookies(response, refresh_token)
     
@@ -1618,7 +1651,7 @@ def refresh_spotify_token():
 
     print("Token has been refreshed")
     
-    return token_info['access_token']
+    return token_info['access_token'], expires_at
         
 def check_token():
     if int(time.time()) > int(redis.get('expires_at') or 0) - 300:
@@ -1629,11 +1662,18 @@ def check_token():
 # Route for refreshing Spotify token
 @app.route('/spotify/refresh', methods=['POST'])
 def spotify_refresh():
-    access_token = refresh_spotify_token()
-    return jsonify({'message': 'Access token refreshed successfully', 'spotify_access_token' : access_token}), 200
+    access_token, expires_at = refresh_spotify_token()
+
+    if expires_at is None:
+        # Handle the case where 'expires_at' is not in token_info
+        # For example, you might return an error message
+        return jsonify({'error': 'expires_at not found in token_info'})
+    
+    
+    return jsonify({'message': 'Access token refreshed successfully', 'spotify_token' : access_token, 'spotify_expires_at' : expires_at}), 200
 
 @app.route('/profile', methods=['GET'])
-@cache.cached(timeout=3600) 
+# @limiter.limit("3/minute")
 @jwt_required()
 def get_user_profile():
     current_user_id = get_jwt_identity()
@@ -1643,9 +1683,85 @@ def get_user_profile():
     profile_data = {
         'id': current_user_id,
         'username': user.username,
+        'email' : user.email,
         'role' : user.role,
     }
     return jsonify({"profile" : profile_data}), 200
+
+@app.route('/profile', methods=['PUT'])
+@jwt_required()
+def edit_profile():
+    current_user_id = get_jwt_identity()
+    current_user = db.session.get(User, current_user_id)
+    if not current_user:
+        return jsonify({'message': 'User not found'}), 404
+
+    data = request.get_json()
+    username = data.get('username')
+    email = data.get('email')
+
+    if username:
+        user_with_same_username = User.query.filter_by(username=username).first()
+        if user_with_same_username and user_with_same_username.id != current_user_id:
+            return jsonify({'exists_name': True}), 200
+
+    if email:
+        user_with_same_email = User.query.filter_by(email=email).first()
+        if user_with_same_email and user_with_same_email.id != current_user_id:
+            return jsonify({'exists_email': True}), 200
+
+    if 'username' in data:
+        current_user.username = data['username']
+    if 'email' in data:
+        current_user.email = data['email']
+
+    db.session.commit()
+
+    return jsonify({'message': 'Profile updated successfully'}), 200
+
+@app.route('/request-reset', methods=['POST'])
+def request_reset():
+    data = request.get_json()
+    email = data.get('email')
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({'message': 'Email not found'}), 404
+
+    # Generate a unique token for this user
+    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+    token = s.dumps(user.id)
+
+    # Generate a URL for the reset page, including the token as a parameter
+    reset_url = url_for('reset_password', token=token, _external=True)
+
+    # Send the user an email with the reset link
+    send_email(email, 'Password Reset Request', 'Click this link to reset your password: ' + reset_url)
+
+    return jsonify({'message': 'Password reset email sent'}), 200
+
+@app.route('/personal/reset-password/<token>', methods=['POST'])
+def reset_password(token):
+    data = request.get_json()
+    new_password = data.get('password')
+
+    # Decode the token to get the user ID
+    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+    try:
+        user_id = s.loads(token, max_age=3600)  # Token is valid for 1 hour
+    except:
+        return jsonify({'message': 'Invalid or expired token'}), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'message': 'User not found'}), 404
+
+    # Hash the new password and update the user's password
+    user.password = generate_password_hash(new_password)
+
+    db.session.commit()
+
+    return jsonify({'message': 'Password updated successfully'}), 200
 
 
 @app.route('/logout')
@@ -1675,7 +1791,7 @@ def upload_genres_image_to_cloudinary(image_url, genre_key):
         print(f"Error uploading image to Cloudinary: {e}")
         return None
     
-def send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars):
+def send_email(recipient_email):
     try:
         # SMTP Configuration
         smtp_server = 'smtp.gmail.com'
@@ -1684,22 +1800,22 @@ def send_email(sender_email, sender_password, recipient_email, subject, template
         # Create SMTP object
         server = smtplib.SMTP(smtp_server, smtp_port)
         server.starttls()  # Start TLS encryption
-        server.login(sender_email, sender_password)
+        server.login('dennisofcetus98@gmail.com','yuqm gfyd zdmi pjmg')
 
         # Create message
         msg = MIMEMultipart()
         msg['From'] = 'Pyppo The Final'
         msg['To'] = recipient_email
-        msg['Subject'] = subject
+        msg['Subject'] = 'Thank you for your subcribtion for Pyppo'
 
         # Render HTML template
-        html_content = render_template(template_name, **template_vars)
+        html_content = render_template('thank_mail.html')
 
         # Attach HTML content
         msg.attach(MIMEText(html_content, 'html'))
 
         # Send email
-        server.sendmail(sender_email, recipient_email, msg.as_string())
+        server.sendmail('dennisofcetus98@gmail.com', recipient_email, msg.as_string())
         print("Email sent successfully!")
         server.quit()
 
@@ -1711,7 +1827,7 @@ def send_email(sender_email, sender_password, recipient_email, subject, template
         print("An error occurred:", e)
         print("Please check your SMTP server settings and try again.")
 
-subject = 'Test Email'
+
 message = 'This is a test email sent using Python.'
 
 def upgrade_to_premium(user_id):
@@ -1722,7 +1838,7 @@ def upgrade_to_premium(user_id):
     
 @app.route('/send-mail')
 def send_thanks_mail():
-    send_email('dennisofcetus98@gmail.com', 'yuqm gfyd zdmi pjmg', 'delta06coder@gmail.com', subject=subject, template_name='thank_mail.html', name='John', age=30)
+    send_email('nguyenhuuhieu304@gmail.com')
     return "Email sent successfully"
 
 scheduler = BackgroundScheduler()
@@ -1745,6 +1861,8 @@ def healthcheck():
     except Exception as e:
         # If an error occurred, return a 500 status code and the error message
         return jsonify({"status": "Error", "message": str(e)}), 500
+    
+
     
 # @app.route('/api')
 # def redirect_to_swagger():

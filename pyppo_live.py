@@ -118,7 +118,7 @@ def get_my_rooms():
     my_rooms = Room.query.filter_by(host_id=host_id).all()  # Query for all rooms hosted by this user
 
     if not my_rooms:
-        return jsonify({"error": "No rooms found"}), 404
+        return jsonify({"message": "No rooms found"}), 404
 
     # Convert the rooms to a format that can be JSONified
     my_rooms = [{"id": room.id, "name": room.name } for room in my_rooms]
@@ -159,6 +159,13 @@ def personal_room_delete():
         # If the room doesn't exist, return an error
         return jsonify({'error': 'Room not found'}), 404
 
+    # Find all the room members in the room
+    room_members = RoomMember.query.filter_by(room_id=room_id).all()
+
+    # Delete all the room members
+    for member in room_members:
+        db.session.delete(member)
+
     # Delete the room
     db.session.delete(room)
 
@@ -166,7 +173,7 @@ def personal_room_delete():
     db.session.commit()
 
     # Return a success message
-    return jsonify({'message': 'Room deleted successfully'}), 200
+    return jsonify({'message': 'Room and all associated members deleted successfully'}), 200
 
 
 @app.route('/rooms/all', methods=['GET'])
@@ -186,9 +193,11 @@ def create_room():
 
     # Count the number of existing rooms for this user
     room_count = Room.query.filter_by(host_id=host_id).count()
-
+    
+    host = User.query.filter_by(id=host_id).first()
+    host_name = host.username if host else "Unknown"
     # Generate the name for the new room
-    room_name = f"Room #{room_count + 1}"
+    room_name = f"{host_name} Room #{room_count + 1}"
 
     try:
         new_room = Room(name=room_name, host_id=host_id)
@@ -197,7 +206,7 @@ def create_room():
 
     db.session.add(new_room)
     db.session.commit()
-    return jsonify({"msg": f"{room_name} created successfully", "room_id": new_room.id})
+    return jsonify({"msg": f"{room_name} created successfully"})
 
 @socketio.on('join')
 @jwt_required()
