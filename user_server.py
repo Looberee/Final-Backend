@@ -411,7 +411,7 @@ def edit_pyppo_user_playlist_by_id():
             playlist.name = new_name
             # Commit the changes to the database
             db.session.commit()
-            return jsonify({'message': 'Playlist name updated successfully'})
+            return jsonify({'message': 'Playlist name updated successfully'}), 200
         else:
             return jsonify({'error': 'Unauthorized'}), 401
     else:
@@ -756,7 +756,7 @@ def check_favourite_track():
     else:
         return jsonify({'message': 'User preference not found'}), 404
     
-@app.route('/personal/favourites/artist', methods=['POST'])
+@app.route('/personal/favourites/artists', methods=['POST'])
 @jwt_required()
 def add_personal_favourite_artist():
     current_user_id = get_jwt_identity()
@@ -833,7 +833,7 @@ def get_random_artists():
     else:
         return jsonify({'message': 'No favorite artists found'}), 404
     
-@app.route('/personal/favourites/artist', methods=['DELETE'])
+@app.route('/personal/favourites/artists', methods=['DELETE'])
 @jwt_required()
 def delete_personal_favourites_artist():
     current_user_id = get_jwt_identity()
@@ -854,7 +854,7 @@ def delete_personal_favourites_artist():
     else:
         return jsonify({'message': 'No favorite artists found'}), 404
     
-@app.route('/personal/favourites/artist/check', methods=['POST'])
+@app.route('/personal/favourites/artists/check', methods=['POST'])
 @jwt_required()
 def check_favourite_artist():
     current_user_id = get_jwt_identity()
@@ -1296,7 +1296,7 @@ def recommend_tracks_by_genre(genre):
         return jsonify({'error': str(e)})
     
 # ------------------- ARTIST ------------------------ #
-@app.route('/artist/<path:artist_id>')
+@app.route('/artists/<path:artist_id>')
 @cache.cached(timeout=3600) 
 def get_artist(artist_id):
     # Check if the artist is already in the database
@@ -1373,7 +1373,7 @@ def fetch_top_tracks_for_artist(sp, artist_id):
     # Return only the first 6 tracks
     return tracks[:6]
 
-@app.route('/artist/<path:artist_id>/top-tracks')
+@app.route('/artists/<path:artist_id>/top-tracks')
 @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
 def fetch_top_tracks(artist_id):
     access_token = redis.get('spotify_access_token').decode('utf-8')
@@ -1735,36 +1735,38 @@ def request_reset():
     token = s.dumps(user.id)
 
     # Manually construct the URL for the reset page, using the load balancer's address and port
-    reset_url = 'http://127.0.0.1:5000/confirm-email/' + token
+    reset_url = 'http://localhost:3000/reset-password/' + token
 
     # Send the user an email with the reset link
     send_reset_email(email, 'Password Reset Request', 'Click this link to reset your password: ' + reset_url)
 
     return jsonify({'message': 'Password reset email sent'}), 200
 
-@app.route('/confirm-email/<token>', methods=['GET'])
-def confirm_email(token):
-    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
-    try:
-        user_id = s.loads(token, max_age=3600)
-    except SignatureExpired:
-        return jsonify({'message': 'The confirmation link is expired.'}), 400
-    except BadTimeSignature:
-        return jsonify({'message': 'The confirmation link is invalid.'}), 400
+# @app.route('/confirm-email/<token>', methods=['GET'])
+# def confirm_email(token):
+#     s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+#     try:
+#         user_id = s.loads(token, max_age=3600)
+#     except SignatureExpired:
+#         return jsonify({'message': 'The confirmation link is expired.'}), 400
+#     except BadTimeSignature:
+#         return jsonify({'message': 'The confirmation link is invalid.'}), 400
 
-    user = User.query.get(user_id)
-    if not user:
-        return jsonify({'message': 'User not found'}), 404
+#     user = User.query.get(user_id)
+#     if not user:
+#         return jsonify({'message': 'User not found'}), 404
 
-    user.email_confirmed = True
-    db.session.commit()
+#     user.email_confirmed = True
+#     db.session.commit()
 
-    return jsonify({'message': 'Email confirmed successfully'}), 200
+#     return jsonify({'message': 'Email confirmed successfully'}), 200
 
 @app.route('/personal/reset-password/<token>', methods=['POST'])
 def reset_password(token):
     data = request.get_json()
     new_password = data.get('password')
+    
+    print(token)
 
     # Decode the token to get the user ID
     s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
@@ -1775,14 +1777,24 @@ def reset_password(token):
 
     user = User.query.get(user_id)
     if not user:
+        print('-------------------')
+        print('User not found')
+        print('-------------------')
         return jsonify({'message': 'User not found'}), 404
 
     # Hash the new password and update the user's password
-    user.password = generate_password_hash(new_password)
+    user.password_hash = generate_password_hash(new_password)
+    
+    if check_password_hash(user.password_hash, new_password):
+        print('-------------------')
+        print('Password updated successfully')
+        print('-------------------')
+    else:
+        return jsonify({'message': 'Password not updated'}), 400
 
     db.session.commit()
 
-    return jsonify({'message': 'Password updated successfully'}), 200
+    return jsonify({'message': 'Password updated successfully', 'password' : new_password, 'user' : user.username}), 200
 
 
 @app.route('/logout')

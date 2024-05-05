@@ -8,7 +8,7 @@ from flask_session import Session
 from flask_caching import Cache
 from flask_socketio import SocketIO, emit
 from flask_mail import Mail, Message
-from flask_restx import Api, Resource, fields
+from flask_restx import Api, Resource, fields, reqparse
 from flask_redis import FlaskRedis
 
 
@@ -89,6 +89,14 @@ app = Flask(__name__, instance_relative_config=True)
 # app.register_blueprint(api.blueprint)
 # api = Api(app)
 app.secret_key = 'Delta1006'
+
+authorizations = {
+    'Bearer Auth': {
+        'type': 'apiKey',
+        'in': 'header',
+        'name': 'Authorization'
+    }
+}
 
 
 login_manager = LoginManager(app)
@@ -175,10 +183,18 @@ cloudinary.config(
     api_key="591486649953755",
     api_secret="t5VPVbTf9eUI3tzReLGPDNZyL8Q"
 )
-api = Api(app, doc='/api')
+api = Api(app, doc='/api', version='1.0', title='Pyppo Web Music API', description='', authorizations=authorizations)
 
-playlist_ns = api.namespace('personal', description='Personal playlists operations')
-
+# ------------------- NAMESPACE -----------------------------
+personal_ns = api.namespace('personal', description='Personal playlists operations')
+authorize_ns = api.namespace('authorize', description='Authorization operations')
+playback_ns = api.namespace('playback', description='Playback operations')
+profile_ns = api.namespace('profile', description='Profile operations')
+heathcheck_ns = api.namespace('heathcheck', description='Health check operations')
+artists_ns = api.namespace('artists', description='Artists operations')
+payment_ns = api.namespace('payment', description='Payment operations')
+extra_ns = api.namespace('extra', description='Extra operations')
+# ------------------- MODELS -----------------------------
 playlist_model = api.model('Playlist', {
     'id': fields.Integer,
     'name': fields.String,
@@ -211,15 +227,19 @@ playlist_create_model = api.model('PlaylistCreate', {
     'playlist_name': fields.String(required=True, description='Name of the playlist to be created')
 })
 
-@playlist_ns.route('/playlists')
+
+edit_playlist_parser = reqparse.RequestParser()
+edit_playlist_parser.add_argument('encode_id', type=str, required=True, help='Encode ID cannot be blank')
+edit_playlist_parser.add_argument('new_name', type=str, required=True, help='New name cannot be blank')
+delete_parser = reqparse.RequestParser()
+delete_parser.add_argument('encode_id', type=str, required=True, help='Encode ID cannot be blank')
+
+@personal_ns.route('/playlists')
 class PersonalPlaylists(Resource):
     @api.doc(security='apikey')
     @jwt_required()
     @api.marshal_with(playlist_model, envelope='user_playlists')
     def get(self):
-        """
-        Retrieve all playlists for the current user.
-        """
         current_user_id = get_jwt_identity()
         user_playlists = UserPlaylist.query.filter_by(user_id=current_user_id).all()
         playlists_info = []
@@ -238,16 +258,9 @@ class PersonalPlaylists(Resource):
 
     @api.doc(security='apikey')
     @jwt_required()
-    @api.expect(playlist_create_model)
     @api.response(201, 'Playlist created successfully', playlist_model)
     def post(self):
-        """
-        Create a new playlist for the current user.
-        """
         current_user_id = get_jwt_identity()
-        playlist_name = api.payload.get('playlist_name')
-        if not playlist_name:
-            return {'message': 'Invalid request. Please provide a playlist name'}, 400
         user_playlists_count = UserPlaylist.query.filter_by(user_id=current_user_id).count()
         playlist_name = f'My playlist # {user_playlists_count + 1}'
         user_id = current_user_id
@@ -258,25 +271,50 @@ class PersonalPlaylists(Resource):
 
     @api.doc(security='apikey')
     @jwt_required()
+    @api.expect(edit_playlist_parser)
     @api.response(204, 'Playlist updated successfully')
     def put(self):
-        """
-        Update a playlist for the current user.
-        """
-        # Your code to update a playlist goes here
-        return {'message': 'Playlist updated successfully'}, 204
+        args = edit_playlist_parser.parse_args()
+        encode_id = args.get('encode_id')
+        new_name = args.get('new_name')
+
+        # Find the playlist by ID
+        playlist = UserPlaylist.query.filter_by(encode_id=encode_id).first()
+        if playlist:
+            current_user_id = get_jwt_identity()
+            if playlist.user_id == current_user_id:  # Check if the playlist belongs to the current user
+                playlist.name = new_name
+                # Commit the changes to the database
+                db.session.commit()
+                return {'message': 'Playlist name updated successfully'}, 204
+            else:
+                return {'error': 'Unauthorized'}, 401
+        else:
+            return {'error': 'Playlist not found'}, 404
 
     @api.doc(security='apikey')
     @jwt_required()
+    @api.expect(delete_parser)
     @api.response(204, 'Playlist deleted successfully')
     def delete(self):
-        """
-        Delete a playlist for the current user.
-        """
-        # Your code to delete a playlist goes here
-        return {'message': 'Playlist deleted successfully'}, 204
+        args = delete_parser.parse_args()
+        encode_id = args.get('encode_id')
+
+        # Find the playlist by ID
+        playlist = UserPlaylist.query.filter_by(encode_id=encode_id).first()
+        if playlist:
+            current_user_id = get_jwt_identity()
+            if playlist.user_id == current_user_id:  # Check if the playlist belongs to the current user
+                # Delete the playlist
+                db.session.delete(playlist)
+                db.session.commit()
+                return {'message': 'Playlist deleted successfully'}, 204
+            else:
+                return {'error': 'Unauthorized'}, 401
+        else:
+            return {'error': 'Playlist not found'}, 404
     
-@playlist_ns.route('/playlists/<string:encode_id>/tracks')
+@personal_ns.route('/playlists/<string:encode_id>/tracks')
 class PersonalPlaylistTracks(Resource):
     @api.doc(security='apikey')
     @jwt_required()
@@ -319,41 +357,95 @@ class PersonalPlaylistTracks(Resource):
             return {'playlist': playlist_info}
         else:
             return {'error': 'Playlist not found'}, 404
+        
+add_track_parser = reqparse.RequestParser()
+add_track_parser.add_argument('playlist_id', type=str, required=True, help='Playlist ID is required')
+add_track_parser.add_argument('track_id', type=str, required=True, help='Track ID is required')
 
-@playlist_ns.route('/playlists/<string:playlist_id>/track/<string:track_id>')
+@personal_ns.route('/playlists/<string:playlist_id>/track/<string:track_id>')
 class PersonalPlaylistTrack(Resource):
     @api.doc(security='apikey')
     @jwt_required()
     def post(self, playlist_id, track_id):
-        """
-        Add a track to a specific playlist of the current user.
-        """
         current_user_id = get_jwt_identity()
         playlist = UserPlaylist.query.filter_by(encode_id=playlist_id, user_id=current_user_id).first()
-
         if playlist:
-            # Your code to add a track to the playlist goes here
-            return {'message': 'Track added to the playlist successfully'}, 201
+            # Check if the track exists in the Track model
+            track = Track.query.filter_by(spotify_id=track_id).first()
+            if track:
+                existing_track = UserPlaylistTrack.query.filter_by(user_playlist_id=playlist.id, track_id=track.id).first()
+                if existing_track:
+                    return {'error': 'Track already exists in the playlist'}, 400
+
+                # Track exists, add it to the user's playlist
+                new_playlist_track = UserPlaylistTrack(user_playlist_id=playlist.id, track_id=track.id)
+                db.session.add(new_playlist_track)
+                db.session.commit()
+                return {'message': 'Track added to the playlist successfully'}, 201
+            else:
+                # Track does not exist, fetch it from Spotify API
+                access_token = redis.get('spotify_access_token').decode('utf-8')
+                sp = Spotify(auth_manager=sp_oauth, auth = access_token)
+                
+                track_data = sp.track(track_id)
+                artist_detail = sp.artist(track_data['artists'][0]['id'])
+                genres = ', '.join(artist_detail['genres'])
+                
+                if track_data:
+                    # Upload the track image to Cloudinary
+                    cloudinary_img_url = upload_image_to_cloudinary(track_data['album']['images'][0]['url'])
+
+                    # Create a new track instance with Cloudinary image URL
+                    new_track = Track(
+                        spotify_id=track_id,
+                        name=track_data['name'],
+                        album_id=track_data['album']['id'],
+                        artists=','.join([artist['name'] for artist in track_data['artists']]),
+                        duration_ms=track_data['duration_ms'],
+                        popularity=track_data['popularity'],
+                        preview_url=track_data['preview_url'],
+                        release_date=track_data['album']['release_date'],
+                        album_name=track_data['album']['name'],
+                        album_release_date=track_data['album']['release_date'],
+                        cloudinary_img_url=cloudinary_img_url, # Cloudinary image URL
+                        track_genres = genres,
+                    )
+                    
+                    db.session.add(new_track)
+                    db.session.commit()
+
+                    # Add the new track to the user's playlist
+                    new_playlist_track = UserPlaylistTrack(user_playlist_id=playlist.id, track_id=new_track.id)
+                    db.session.add(new_playlist_track)
+                    db.session.commit()
+                    
+                    return {'message': 'Track added to the playlist successfully'}, 201
+                else:
+                    return {'error': 'Failed to fetch track data from Spotify API'}, 500
         else:
             return {'error': 'Playlist not found'}, 404
 
     @api.doc(security='apikey')
     @jwt_required()
     def delete(self, playlist_id, track_id):
-        """
-        Remove a track from a specific playlist of the current user.
-        """
         current_user_id = get_jwt_identity()
         playlist = UserPlaylist.query.filter_by(encode_id=playlist_id, user_id=current_user_id).first()
 
         if playlist:
-            # Your code to remove a track from the playlist goes here
-            return {'message': 'Track removed from the playlist successfully'}, 204
+            track = Track.query.filter_by(spotify_id=track_id).first()
+            if track:
+                playlist_track = UserPlaylistTrack.query.filter_by(user_playlist_id=playlist.id, track_id=track.id).first()
+                if playlist_track:
+                    db.session.delete(playlist_track)
+                    db.session.commit()
+                    return {'message': 'Track removed from the playlist successfully'}, 204
+                else:
+                    return {'error': 'Track not found in the playlist'}, 404
+            else:
+                return {'error': 'Track not found'}, 404
         else:
             return {'error': 'Playlist not found'}, 404
         
-
-    
 artist_model = api.model('Artist', {
     'id': fields.Integer,
     'name': fields.String,
@@ -365,31 +457,43 @@ artist_model = api.model('Artist', {
     
 favourites_ns = api.namespace('personal/favourites', description='Personal favorites tracks operations')
 
+add_artist_parser = reqparse.RequestParser()
+add_artist_parser.add_argument('artist_id', type=str, required=True, help='Artist ID')
+delete_artist_parser = reqparse.RequestParser()
+delete_artist_parser.add_argument('artist_id', type=str, required=True, help='Artist ID')
+
 @favourites_ns.route('/artists')
 class PersonalFavoriteArtists(Resource):
-    @api.doc(security='apikey')
+    @favourites_ns.doc(security='apikey')
     @jwt_required()
-    @api.marshal_with(artist_model, envelope='favorite_artists')
+    @favourites_ns.marshal_with(artist_model, envelope='favourite_artists')
     def get(self):
-        """
-        Retrieve personal favorite artists for the current user.
-        """
         current_user_id = get_jwt_identity()
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
         if user_pref:
-            return user_pref.favorite_artists, 200
+            favorite_artists = user_pref.favorite_artists
+            serialized_artists = []
+            for artist in favorite_artists:
+                serialized_artists.append({
+                    'id': artist.id,
+                    'name': artist.name,
+                    'genres': artist.genres.split(','),
+                    'spotify_image_url': artist.cloudinary_artist_image_url,
+                    'artist_id': artist.spotify_id,
+                    'followers' : artist.followers
+                })
+            return serialized_artists, 200
         else:
-            return {'message': 'No favorite artists found'}, 404
+            return {'message': 'No favourite artists found'}, 200
 
-    @api.doc(security='apikey')
+    @favourites_ns.doc(security='apikey')
     @jwt_required()
+    @favourites_ns.expect(add_artist_parser, validate=True)
     def post(self):
-        """
-        Add a personal favorite artist for the current user.
-        """
-        current_user_id = get_jwt_identity()
-        artist_id = request.json.get('artist_id')
+        args = add_artist_parser.parse_args()
+        artist_id = args['artist_id']
 
+        current_user_id = get_jwt_identity()
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
         if user_pref:
             artist = Artist.query.filter_by(spotify_id=artist_id).first()
@@ -403,16 +507,30 @@ class PersonalFavoriteArtists(Resource):
             else:
                 return {'message': 'Artist not found'}, 404
         else:
-            return {'message': 'User preference not found'}, 404
+            # Create a new UserPreference instance
+            user_pref = UserPreference(user_id=current_user_id)
+            db.session.add(user_pref)
+            db.session.commit()
 
-    @api.doc(security='apikey')
+            artist = Artist.query.filter_by(spotify_id=artist_id).first()
+            if artist:
+                user_pref.favorite_artists.append(artist)
+                db.session.commit()
+                return {'message': 'Artist added to favorites successfully'}, 200
+            else:
+                return {'message': 'Artist not found'}, 404
+
+    @favourites_ns.doc(security='apikey')
     @jwt_required()
+    @favourites_ns.expect(delete_artist_parser, validate=True)
     def delete(self):
         """
         Delete a personal favorite artist for the current user.
         """
+        args = delete_artist_parser.parse_args()
+        artist_id = args['artist_id']
+
         current_user_id = get_jwt_identity()
-        artist_id = request.json.get('artist_id')
 
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
         if user_pref:
@@ -427,39 +545,48 @@ class PersonalFavoriteArtists(Resource):
             else:
                 return {'message': 'Artist not found'}, 404
         else:
-            return {'message': 'User preference not found'}, 404
+            return {'message': 'No favorite artists to remove'}, 404
 
-@favourites_ns.route('/artist/check')
+check_artist_parser = reqparse.RequestParser()
+check_artist_parser.add_argument('artist_id', type=str, required=True, help='Artist ID')
+
+@favourites_ns.route('/artists/check')
 class CheckFavoriteArtist(Resource):
     @api.doc(security='apikey')
     @jwt_required()
+    @favourites_ns.expect(check_artist_parser, validate=True)
     def post(self):
         """
         Check if an artist is a personal favorite for the current user.
         """
+        args = check_artist_parser.parse_args()
+        artist_id = args['artist_id']
+
         current_user_id = get_jwt_identity()
-        artist_id = request.json.get('artist_id')
 
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
         if user_pref:
-            artist = Artist.query.filter_by(spotify_id=artist_id).first()
-            if artist:
-                if artist in user_pref.favorite_artists:
-                    return {'favourite': True}, 200
-                else:
-                    return {'favourite': False}, 200
-            else:
-                return {'message': 'Artist not found'}, 404
+            is_favorite = any(artist.spotify_id == artist_id for artist in user_pref.favorite_artists)
+            return {'favourite': is_favorite}, 200
         else:
-            return {'message': 'User preference not found'}, 404
+            # Create a new UserPreference instance
+            user_pref = UserPreference(user_id=current_user_id)
+            db.session.add(user_pref)
+            db.session.commit()
+
+            is_favorite = any(artist.spotify_id == artist_id for artist in user_pref.favorite_artists)
+            return {'favourite': is_favorite}, 200
         
 personal_ns = api.namespace('personal', description='Personal operations')
+
+add_recent_parser = reqparse.RequestParser()  # create an instance of the parser
+add_recent_parser.add_argument('spotify_id', required=True, help="Spotify ID is required")
+add_recent_parser.add_argument('played_at', type=int, required=True, help="Played at timestamp is required")
 
 @personal_ns.route('/recent/tracks')
 class PersonalRecentTracks(Resource):
     @api.doc(security='apikey')
     @jwt_required()
-    @api.marshal_with(track_model, envelope='recent_tracks')
     def get(self):
         """
         Retrieve recent tracks for the current user.
@@ -484,29 +611,36 @@ class PersonalRecentTracks(Resource):
 
     @api.doc(security='apikey')
     @jwt_required()
+    @api.expect(add_recent_parser)
     def post(self):
-        """
-        Add a recent track for the current user.
-        """
-        current_user_id = get_jwt_identity()
-        data = request.json
-        spotify_id = data.get('spotify_id')
-        played_at_timestamp = data.get('played_at')  # Assuming played_at is a timestamp
-        played_at = datetime.fromtimestamp(played_at_timestamp / 1000)
-        
-        # Your logic to add a recent track goes here
-        
-        return {'message': 'Recent track added successfully'}, 200
+        args = add_recent_parser.parse_args()  # parse the incoming request
 
-@personal_ns.route('/favourites/tracks')
+        current_user_id = get_jwt_identity()
+        spotify_id = args['spotify_id']
+        played_at_timestamp = args['played_at']  # Assuming played_at is a timestamp
+        played_at = datetime.fromtimestamp(played_at_timestamp / 1000)
+
+        # Your logic to add a recent track goes here
+
+        return {'message': 'Recent track added successfully'}, 200
+    
+post_track_parser = reqparse.RequestParser()
+post_track_parser.add_argument('spotify_id', type=str, required=True, help='Spotify ID')
+delete_parser = reqparse.RequestParser()
+delete_parser.add_argument('spotify_id', type=str, required=True, help='Spotify ID of the track to delete')
+
+from sqlalchemy.orm import joinedload
+
+@favourites_ns.route('/tracks')
 class PersonalFavoriteTracks(Resource):
     @api.doc(security='apikey')
     @jwt_required()
-    @api.marshal_with(track_model, envelope='favourite_tracks')
+    @api.doc(description="Get a user's favorite tracks",
+                responses={
+                    200: ("List of favorite tracks", "Track"),
+                    404: "No favorite tracks found"
+                })
     def get(self):
-        """
-        Retrieve favorite tracks for the current user.
-        """
         current_user_id = get_jwt_identity()
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
         if user_pref:
@@ -517,38 +651,73 @@ class PersonalFavoriteTracks(Resource):
                     'id': track.id,
                     'name': track.name,
                     'artists': track.artists.split(','),
-                    'duration': track.duration,
-                    'genres': track.genres,
-                    'release_date': track.release_date,
-                    'spotify_image_url': track.spotify_image_url,
-                    'spotify_id': track.spotify_id
+                    'duration': track.duration_ms,
+                    'genres' : track.track_genres,
+                    'release_date': track.album_release_date,
+                    'spotify_image_url': track.cloudinary_img_url,
+                    'spotify_id' : track.spotify_id
                 })
-            return serialized_tracks, 200
+            return {'favourite_tracks': serialized_tracks}, 200
         else:
             return {'message': 'No favorite tracks found'}, 404
 
     @api.doc(security='apikey')
     @jwt_required()
+    @api.expect(post_track_parser, validate=True)
     def post(self):
-        """
-        Add a favorite track for the current user.
-        """
-        current_user_id = get_jwt_identity()
-        data = request.json
-        spotify_id = data.get('spotify_id')
+        try:
+            args = post_track_parser.parse_args()
+            spotify_id = args['spotify_id']
 
-        # Your logic to add a favorite track goes here
+            current_user_id = get_jwt_identity()
+            user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
 
-        return {'message': 'Track added to favorites successfully'}, 200
+            if not user_pref:
+                user_pref = UserPreference(user_id=current_user_id)
+                db.session.add(user_pref)
+
+            # Check if track already exists
+            track = Track.query.filter_by(spotify_id=spotify_id).first()
+            if not track:
+                access_token = redis.get('spotify_access_token').decode('utf-8')
+                sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+                track_details = sp.track(spotify_id)
+                artist_detail = sp.artist(track_details['artists'][0]['id'])
+                genres = ', '.join(artist_detail['genres'])
+
+                cloudinary_img_url = upload_image_to_cloudinary(track_details['album']['images'][0]['url'])
+                track = Track(
+                    spotify_id=spotify_id,
+                    name=track_details['name'],
+                    album_id=track_details['album']['id'],
+                    artists=','.join([artist['name'] for artist in track_details['artists']]),
+                    duration_ms=track_details['duration_ms'],
+                    popularity=track_details['popularity'],
+                    preview_url=track_details['preview_url'],
+                    release_date=track_details['album']['release_date'],
+                    album_name=track_details['album']['name'],
+                    album_release_date=track_details['album']['release_date'],
+                    cloudinary_img_url=cloudinary_img_url,
+                    track_genres=genres,
+                )
+                db.session.add(track)
+                db.session.commit()
+
+            user_pref.favorite_tracks.append(track)
+            db.session.commit()
+
+            return {'message': 'Track added to favorites successfully'}, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
 
     @api.doc(security='apikey')
     @jwt_required()
+    @api.expect(delete_parser)
     def delete(self):
-        """
-        Delete a favorite track for the current user.
-        """
+        args = delete_parser.parse_args()
         current_user_id = get_jwt_identity()
-        spotify_id = request.json.get('spotify_id')
+        spotify_id = args['spotify_id']
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
         if user_pref:
             track = Track.query.filter_by(spotify_id=spotify_id).first()
@@ -561,16 +730,21 @@ class PersonalFavoriteTracks(Resource):
         else:
             return {'message': 'No favorite tracks found'}, 404
 
-@personal_ns.route('/favourites/track/check')
+check_parser = reqparse.RequestParser()
+check_parser.add_argument('spotify_id', type=str, required=True, help='Spotify ID of the track to check')
+
+@favourites_ns.route('/track/check')
 class CheckFavoriteTrack(Resource):
     @api.doc(security='apikey')
     @jwt_required()
+    @api.expect(check_parser)
     def post(self):
         """
         Check if a track is a favorite for the current user.
         """
+        args = check_parser.parse_args()
         current_user_id = get_jwt_identity()
-        spotify_id = request.json.get('spotify_id')
+        spotify_id = args['spotify_id']
         user_pref = UserPreference.query.filter_by(user_id=current_user_id).first()
         if user_pref:
             is_favorite = any(track.spotify_id == spotify_id for track in user_pref.favorite_tracks)
@@ -587,95 +761,28 @@ def refresh_spotify_token():
     redis.set('spotify_access_token', token_info['access_token'])
     return token_info['access_token']
 
-# @app.route('/transfer-playback', methods=['POST'])
-# def transfer_playback():
-#     access_token = redis.get('spotify_access_token').decode('utf-8')  # Decode the token
-#     target_device_id = request.json.get('target_device_id')  # Get the target device ID from the request
-
-#     # Initialize Spotify client
-#     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-
-#     try:
-#         # Transfer playback to the specified device
-#         sp.transfer_playback(device_id=target_device_id, force_play=True)
-#         return jsonify({'success': True, 'message': 'Playback transferred successfully.'}), 200
-#     except spotipy.SpotifyException as e:
-#         return jsonify({'success': False, 'message': str(e)}), 400
-    
-# @app.route('/active-devices')
-# def get_active_devices():
-#     access_token = redis.get('spotify_access_token')
-    
-#     if access_token is None:
-#         return jsonify({'message': 'Access token not found in Redis.'}), 404
-    
-#     access_token = access_token.decode('utf-8')  # Decode the token
-    
-#     # Initialize Spotify client
-#     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-    
-#     # Retrieve user's active devices
-#     devices = sp.devices()
-#     active_devices = []
-#     for device in devices['devices']:
-#         if device['is_active']:
-#             active_devices.append({
-#                 'id': device['id'],
-#                 'name': device['name']
-#             })
-
-#     if not active_devices:
-#         return jsonify({'message': 'No active devices found.'}), 404
-    
-#     return jsonify({'devices': active_devices})
-
-# @app.route('/playback/play', methods=['POST'])
-# @jwt_required()
-# def pyppo_play_track():
-#     access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
-#     sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-
-#     track_uri = request.json.get('trackUri')
-#     device_id = request.json.get('myDeviceId')
-    
-#     @retry(stop_max_attempt_number=3, wait_fixed=1000, retry_on_result=lambda result: result is False)
-#     def start_playback():
-#         try:
-#             sp.start_playback(device_id=device_id, uris=[track_uri])
-#             time.sleep(1)
-#             return True  # Success
-#         except spotipy.SpotifyException as e:
-#             if e.http_status == 404:  # No active device found
-#                 print("No active device found. Retrying...")
-#                 refresh_spotify_token()
-#                 return False  # Retry
-#             elif e.http_status == 500:
-#                 refresh_spotify_token()
-#             else:
-#                 raise  # Raise exception for other errors
-
-#     try:
-#         start_playback()
-#         return jsonify({'success': True, 'message': 'Playback started successfully.'}), 200
-#     except Exception as e:
-#         return jsonify({'success': False, 'message': 'Failed to start playback: ' + str(e)}), 500
-    
 success_model = api.model('Success', {
     'success': fields.Boolean(description='Indicates whether the operation was successful'),
     'message': fields.String(description='Additional message related to the operation')
 })
 
-@api.route('/playback/play')
+play_parser = reqparse.RequestParser()
+play_parser.add_argument('trackUri', type=str, required=True, help='Spotify URI of the track to play')
+play_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to play the track on')
+
+@playback_ns.route('/play')
 class PlaybackPlay(Resource):
     @api.doc(description='Start playback of a track on a specified device')
     @api.response(200, 'Success', success_model)
     @api.response(400, 'Bad Request', success_model)
+    @api.expect(play_parser)
     def post(self):
+        args = play_parser.parse_args()
         access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
-        track_uri = api.payload.get('trackUri')
-        device_id = api.payload.get('myDeviceId')
+        track_uri = args['trackUri']
+        device_id = args['myDeviceId']
 
         @retry(stop_max_attempt_number=3, wait_fixed=1000, retry_on_result=lambda result: result is False)
         def start_playback():
@@ -699,31 +806,41 @@ class PlaybackPlay(Resource):
         except Exception as e:
             return {'success': False, 'message': 'Failed to start playback: ' + str(e)}, 500
 
-@api.route('/playback/pause')
+pause_parser = reqparse.RequestParser()
+pause_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to pause the playback on')
+
+@playback_ns.route('/pause')
 class PlaybackPause(Resource):
     @api.doc(description='Pause playback on a specified device')
     @api.response(200, 'Success', success_model)
     @api.response(400, 'Bad Request', success_model)
+    @api.expect(pause_parser)
     def post(self):
+        args = pause_parser.parse_args()
         access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
-        device_id = api.payload.get('myDeviceId')
+        device_id = args['myDeviceId']
 
         sp.pause_playback(device_id=device_id)
 
         return {'success': True, 'message': 'Playback paused successfully'}, 200
 
-@api.route('/playback/resume')
+resume_parser = reqparse.RequestParser()
+resume_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to resume the playback on')
+
+@playback_ns.route('/resume')
 class PlaybackResume(Resource):
     @api.doc(description='Resume playback on a specified device')
     @api.response(200, 'Success', success_model)
     @api.response(400, 'Bad Request', success_model)
+    @api.expect(resume_parser)
     def post(self):
+        args = resume_parser.parse_args()
         access_token = redis.get('spotify_access_token').decode('utf-8')  # Extract token from request header
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
-        device_id = api.payload.get('myDeviceId')
+        device_id = args['myDeviceId']
 
         sp.start_playback(device_id=device_id)
 
@@ -748,18 +865,18 @@ response_model = api.model('Response', {
     }))
 })
 
-# Define routes
-@api.route('/playback/next')
+
+next_parser = reqparse.RequestParser()
+next_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to play the next track on')
+
+@playback_ns.route('/next')
 class NextTrack(Resource):
-    @api.doc(description='Play the next track on the specified device')
-    @api.expect(api.model('NextTrackRequest', {
-        'myDeviceId': fields.String(description='ID of the target device')
-    }))
-    @api.marshal_with(response_model)
+    @api.expect(next_parser)
     def post(self):
+        args = next_parser.parse_args()
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-        device_id = request.json.get('myDeviceId')
+        device_id = args['myDeviceId']
 
         playlists = sp.featured_playlists(limit=7)['playlists']['items']
         random_playlist = random.choice(playlists)
@@ -786,18 +903,19 @@ class NextTrack(Resource):
         sp.start_playback(device_id=device_id, uris=[current_track_info['track'].get('uri')])
         
         return response_data, 200
+    
+previous_parser = reqparse.RequestParser()
+previous_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to play the previous track on')    
 
-@api.route('/playback/previous')
+@playback_ns.route('/previous')
 class PreviousTrack(Resource):
     @api.doc(description='Play the previous track on the specified device')
-    @api.expect(api.model('PreviousTrackRequest', {
-        'myDeviceId': fields.String(description='ID of the target device')
-    }))
-    @api.marshal_with(response_model)
+    @api.expect(previous_parser)
     def post(self):
+        args = previous_parser.parse_args()
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-        device_id = request.json.get('myDeviceId')
+        device_id = args['myDeviceId']
 
         playlists = sp.featured_playlists(limit=7)['playlists']['items']
         random_playlist = random.choice(playlists)
@@ -825,85 +943,88 @@ class PreviousTrack(Resource):
         
         return response_data, 200
 
-@api.route('/playback/shuffle')
+shuffle_parser = reqparse.RequestParser()
+shuffle_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to toggle shuffle mode on')
+shuffle_parser.add_argument('shuffleState', type=bool, required=True, help='True to enable shuffle, False to disable')
+
+@playback_ns.route('/shuffle')
 class Shuffle(Resource):
     @api.doc(description='Toggle shuffle mode on the specified device')
-    @api.expect(api.model('ShuffleRequest', {
-        'myDeviceId': fields.String(description='ID of the target device'),
-        'shuffleState': fields.Boolean(description='True to enable shuffle, False to disable')
-    }))
-    @api.marshal_with(response_model)
+    @api.expect(shuffle_parser)
     def post(self):
+        args = shuffle_parser.parse_args()
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-        device_id = request.json.get('myDeviceId')
-        shuffle_state = request.json.get('shuffleState')
+        device_id = args['myDeviceId']
+        shuffle_state = args['shuffleState']
 
         sp.shuffle(shuffle_state, device_id=device_id)
         return {'success': True, 'message': f'Shuffle {"enabled" if shuffle_state else "disabled"} successfully.'}, 200
 
-@api.route('/playback/repeat')
+repeat_parser = reqparse.RequestParser()
+repeat_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to set repeat mode on')
+repeat_parser.add_argument('repeatState', type=str, required=True, help='Repeat mode: "track", "context", or "off"')
+
+@playback_ns.route('/repeat')
 class Repeat(Resource):
     @api.doc(description='Set repeat mode on the specified device')
-    @api.expect(api.model('RepeatRequest', {
-        'myDeviceId': fields.String(description='ID of the target device'),
-        'repeatState': fields.String(description='Repeat mode: "track", "context", or "off"')
-    }))
-    @api.marshal_with(response_model)
+    @api.expect(repeat_parser)
     def post(self):
+        args = repeat_parser.parse_args()
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-        device_id = request.json.get('myDeviceId')
-        repeat_state = request.json.get('repeatState')
+        device_id = args['myDeviceId']
+        repeat_state = args['repeatState']
 
         sp.repeat(repeat_state, device_id=device_id)
         return {'success': True, 'message': f'Repeat mode set to {repeat_state} successfully.'}, 200
 
-@api.route('/playback/seek')
+seek_parser = reqparse.RequestParser()
+seek_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to seek playback on')
+seek_parser.add_argument('newPositionMs', type=int, required=True, help='New position in milliseconds')
+
+@playback_ns.route('/seek')
 class Seek(Resource):
     @api.doc(description='Seek playback to a specified position on the currently playing track')
-    @api.expect(api.model('SeekRequest', {
-        'myDeviceId': fields.String(description='ID of the target device'),
-        'newPositionMs': fields.Integer(description='New position in milliseconds')
-    }))
-    @api.marshal_with(response_model)
+    @api.expect(seek_parser)
     def post(self):
-        data = request.json
-        new_position_ms_str = data.get('newPositionMs')
-        
-        if new_position_ms_str is not None:
-            new_position_ms = int(new_position_ms_str)
-            access_token = redis.get('spotify_access_token').decode('utf-8')
-            sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
-            playback_info = sp.current_playback()
-
-            # Check if a track is currently playing
-            if playback_info and playback_info['is_playing']:
-                # Check if repeat mode is active
-                if playback_info['repeat_state'] != 'off':
-                    # Temporarily disable repeat mode
-                    sp.repeat('off')
-
-                # Seek to the new position
-                sp.seek_track(new_position_ms)
-
-                # Re-enable repeat mode if it was active
-                if playback_info['repeat_state'] != 'off':
-                    sp.repeat(playback_info['repeat_state'])
-
-                return {'success': True, 'message': f'Seeked to {new_position_ms} milliseconds'}, 200
-            else:
-                return {'success': False, 'message': 'No track is currently playing'}, 400
-        else:
-            return {'success': False, 'message': 'Invalid new position'}, 400
-
-@api.route('/playback/current_track_position')
-class CurrentTrackPosition(Resource):
-    @api.doc(description='Get the current position of the playback in milliseconds')
-    @api.marshal_with(response_model)
-    def get(self):
+        args = seek_parser.parse_args()
+        new_position_ms = args['newPositionMs']
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+        playback_info = sp.current_playback()
+
+        # Check if a track is currently playing
+        if playback_info and playback_info['is_playing']:
+            # Check if repeat mode is active
+            if playback_info['repeat_state'] != 'off':
+                # Temporarily disable repeat mode
+                sp.repeat('off')
+
+            # Seek to the new position
+            sp.seek_track(new_position_ms)
+
+            # Re-enable repeat mode if it was active
+            if playback_info['repeat_state'] != 'off':
+                sp.repeat(playback_info['repeat_state'])
+
+            return {'success': True, 'message': f'Seeked to {new_position_ms} milliseconds'}, 200
+        else:
+            return {'success': False, 'message': 'No track is currently playing'}, 400
+
+
+current_track_position_parser = reqparse.RequestParser()
+current_track_position_parser.add_argument('myDeviceId', type=str, required=True, help='Spotify ID of the device to get the current track position from')
+
+@playback_ns.route('/current_track_position')
+class CurrentTrackPosition(Resource):
+    @api.doc(description='Get the current position of the playback in milliseconds')
+    @api.expect(current_track_position_parser)
+    def get(self):
+        args = current_track_position_parser.parse_args()
+        access_token = redis.get('spotify_access_token').decode('utf-8')
+        sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
+        device_id = args['myDeviceId']
 
         # Get the current playback information
         playback_info = sp.current_playback()
@@ -935,21 +1056,32 @@ tracks_model = api.model('Tracks', {
     'spotify_image_url': fields.String(description='The URL of the album image')
 })
 
+recommend_genres_parser = reqparse.RequestParser()
+recommend_genres_parser.add_argument('limit', type=int, required=False, help='Limit the number of genres returned')
+
 @api.route('/recommendation/genres')
 class RecommendGenres(Resource):
     @api.doc(description='Get recommended genres')
-    @api.marshal_with(genre_model)
+    @api.expect(recommend_genres_parser)
     def get(self):
+        args = recommend_genres_parser.parse_args()
+        limit = args.get('limit')
+
         # Fetch genres from database and format the response
-        genres = Genre.query.all()
+        genres = Genre.query.limit(limit).all() if limit else Genre.query.all()
         genres_list = [{'id': genre.id, 'genre_name': genre.genre_name, 'genre_image': genre.cloudinary_image_url} for genre in genres]
         return {'genres': genres_list}
+
+recommend_tracks_by_genre_parser = reqparse.RequestParser()
+recommend_tracks_by_genre_parser.add_argument('genre_name', type=str, required=True, help='The name of the genre')
 
 @api.route('/recommendation/genres/<string:genre_name>')
 class RecommendTracksByGenre(Resource):
     @api.doc(params={'genre_name': 'The name of the genre'})
-    @api.marshal_with(tracks_model)
+    @api.expect(recommend_tracks_by_genre_parser)
     def get(self, genre_name):
+        args = recommend_tracks_by_genre_parser.parse_args()
+        genre_name = args['genre_name']
         access_token = redis.get('spotify_access_token').decode('utf-8') 
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
@@ -980,11 +1112,18 @@ def fetch_tracks_by_genre(sp, genre_name):
         formatted_tracks.append(formatted_track)
     return formatted_tracks
 
-@api.route('/recommendation/artists/<genre>')
+recommend_artists_by_genre_parser = reqparse.RequestParser()
+recommend_artists_by_genre_parser.add_argument('genre', type=str, required=True, help='The name of the genre')
+
+@api.route('/recommendation/artists/<string:genre>')
 class RecommendArtistsByGenre(Resource):
+    @api.doc(params={'genre': 'The name of the genre'})
+    @api.expect(recommend_artists_by_genre_parser)
     @jwt_required()
     @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
     def get(self, genre):
+        args = recommend_artists_by_genre_parser.parse_args()
+        genre = args['genre']
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
@@ -994,12 +1133,18 @@ class RecommendArtistsByGenre(Resource):
         except spotipy.SpotifyException as e:
             return jsonify({'error': str(e)})
 
+recommend_tracks_by_genre_parser = reqparse.RequestParser()
+recommend_tracks_by_genre_parser.add_argument('genre', type=str, required=True, help='The name of the genre')
 
-@api.route('/recommendation/tracks/<path:genre>')
+@api.route('/recommendation/tracks/<string:genre>')
 class RecommendTracksByGenre(Resource):
+    @api.doc(params={'genre': 'The name of the genre'})
+    @api.expect(recommend_tracks_by_genre_parser)
     @jwt_required()
     @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
     def get(self, genre):
+        args = recommend_tracks_by_genre_parser.parse_args()
+        genre = args['genre']
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
 
@@ -1045,10 +1190,18 @@ def fetch_artists_by_genre(sp, genre):
     sorted_artists = sorted(formatted_artists, key=lambda x: x['popularity'], reverse=True)[:6]
     return sorted_artists
 
+artist_resource_parser = reqparse.RequestParser()
+artist_resource_parser.add_argument('artist_id', type=str, required=True, help='The Spotify ID of the artist')
+
 @api.route('/artist/<path:artist_id>')
-class Artist(Resource):
+class ArtistResource(Resource):
+    @api.doc(params={'artist_id': 'The Spotify ID of the artist'})
+    @api.expect(artist_resource_parser)
     @cache.cached(timeout=3600)
     def get(self, artist_id):
+        args = artist_resource_parser.parse_args()
+        artist_id = args['artist_id']
+
         # Check if the artist is already in the database
         artist = Artist.query.filter_by(spotify_id=artist_id).first()
 
@@ -1123,141 +1276,33 @@ def fetch_top_tracks_for_artist(sp, artist_id):
     # Return only the first 6 tracks
     return tracks[:6]
 
+top_tracks_parser = reqparse.RequestParser()
+top_tracks_parser.add_argument('artist_id', type=str, required=True, help='The Spotify ID of the artist')
+
 @api.route('/artist/<path:artist_id>/top-tracks')
 class TopTracks(Resource):
+    @api.doc(params={'artist_id': 'The Spotify ID of the artist'})
+    @api.expect(top_tracks_parser)
     @cache.cached(timeout=3600)  # Cache the result for 1 hour (3600 seconds)
     def get(self, artist_id):
+        args = top_tracks_parser.parse_args()
+        artist_id = args['artist_id']
         access_token = redis.get('spotify_access_token').decode('utf-8')
         sp = spotipy.Spotify(auth_manager=sp_oauth, auth=access_token)
         return fetch_artist_top_tracks(sp, [artist_id])
-    
-@api.route('/paypal/payment/capture')
-class PayPalPaymentCapture(Resource):
-    @jwt_required()
-    def post(self):
-        data = request.json
-        user_id = get_jwt_identity()  # Get the user ID from the JWT
-
-        # Extract the relevant information from the data
-        transaction_id = data['id']
-        amount = float(data['purchase_units'][0]['amount']['value'])
-        currency = data['purchase_units'][0]['amount']['currency_code']
-        status = data['status']
-        email = data['payer']['email_address'] 
-        
-        # Create a new Payment object
-        payment = Payment(user_id, transaction_id, amount, currency, status, email)
-        
-        # Add the payment to the database and commit the transaction
-        db.session.add(payment)
-        db.session.commit()
-        
-        # Upgrade the user to premium
-        upgrade_to_premium(user_id)
-        
-        # Return a JSON response with the captured data
-        return jsonify({"payload" : data}), 200
-    
-@api.route('/callback')
-class Callback(Resource):
-    def get(self):
-        """
-        Callback Endpoint.
-
-        This endpoint handles the callback from the Spotify authorization process.
-        """
-        code = request.args.get('code')
-        if not code:
-            return {'message': 'Authorization code is missing'}, 400
-        else:
-            # Call the get_access_token function with the authorization code
-            return get_access_token(code)
-
-@api.route('/authorization')
-class Authorization(Resource):
-    def get(self):
-        """
-        Authorization Endpoint.
-
-        This endpoint redirects users to the Spotify authorization page.
-        """
-        return spotify_authorization()
-
-def spotify_authorization():
-    authorization_params = {
-        'client_id': sp_oauth.client_id,
-        'response_type': 'code',
-        'redirect_uri': sp_oauth.redirect_uri,
-        'scope': sp_oauth.scope,
-    }
-
-    # Create the authorization URL
-    authorization_url = "https://accounts.spotify.com/authorize?" + urlencode(authorization_params)
-
-    # Redirect the user to the Spotify login page
-    return redirect(authorization_url)
-
-@api.route('/get-access-token')
-class GetAccessToken(Resource):
-    def post(self):
-        """
-        Get Access Token.
-        
-        This endpoint retrieves an access token from Spotify using the provided authorization code.
-        """
-        data = request.json
-        code = data.get('code')
-        if not code:
-            return {'error': 'Authorization code is missing'}, 400
-
-        token_info = self._get_access_token(code)
-        return token_info
-
-    def _get_access_token(self, code):
-        token_url = 'https://accounts.spotify.com/api/token'
-
-        # Encode client_id and client_secret to Base64
-        client_credentials = f"{sp_oauth.client_id}:{sp_oauth.client_secret}"
-        base64_credentials = b64encode(client_credentials.encode()).decode()
-
-        # Prepare the request body
-        token_params = {
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': sp_oauth.redirect_uri
-        }
-
-        # Prepare the request headers
-        headers = {
-            'Authorization': f"Basic {base64_credentials}",
-            'Content-Type': 'application/x-www-form-urlencoded'
-        }
-
-        try:
-            # Make a POST request to the Spotify API
-            response = requests.post(token_url, data=token_params, headers=headers)
-            response.raise_for_status()  # Check for HTTP errors
-
-            token_info = response.json()
-
-            # Check if 'access_token' exists in token_info
-            if 'access_token' in token_info:
-                redis.set('spotify_access_token', token_info['access_token'])
-                redis.set('spotify_refresh_token', token_info['refresh_token'])
-            return token_info
-        except requests.exceptions.RequestException as e:
-            return {'error': str(e)}, 500  # Return an error response
+            
+login_parser = reqparse.RequestParser()
+login_parser.add_argument('username', type=str, required=True, help='Username is required')
+login_parser.add_argument('password', type=str, required=True, help='Password is required')
         
 @api.route('/login')
 class Login(Resource):
+    @api.expect(login_parser)
     def post(self):
-        """
-        Login User.
+        args = login_parser.parse_args()
         
-        This endpoint logs in a user with the provided username and password, and returns an access token.
-        """
-        username = request.json.get('username')
-        password = request.json.get('password')
+        username = args.get('username')
+        password = args.get('password')
 
         if not username or not password:
             return {'error': 'Username and password required'}, 400
@@ -1275,60 +1320,76 @@ class Login(Resource):
             refresh_token = create_refresh_token(identity=user.id)
             insert_refresh_token(refresh_token, user.id)
 
+        # Create access token
         access_token = create_access_token(identity=user.id, expires_delta=timedelta(days=3))
 
-        profile = {
+        # Create response
+        resp = make_response({
             'username': user.username,
-            'email': user.email,
-            'role': user.role
-        }
+            'email' : user.email,
+            'role' : user.role
+        })
 
-        response = {'profile': profile, 'login': True, 'access_token': access_token, 'refresh_token': refresh_token, 'spotify_token': redis.get('spotify_access_token').decode('utf-8')}
-        set_access_cookies(response, access_token)
-        set_refresh_cookies(response, refresh_token)
+        # Set the cookies
+        set_access_cookies(resp, access_token)
+        set_refresh_cookies(resp, refresh_token)
 
-        return response, 200
+        return resp
+
+check_auth_parser = reqparse.RequestParser()
+check_auth_parser.add_argument('token', type=str, required=True, help='Token is required')
 
 @api.route('/check-auth')
 class CheckAuth(Resource):
+    @api.expect(check_auth_parser)
     def get(self):
-        """
-        Check Authentication.
-        
-        This endpoint checks if the user is authenticated.
-        """
+        args = check_auth_parser.parse_args()
+        token = args['token']
         try:
             verify_jwt_in_request()
             return {'isAuthenticated': True}, 200
         except:
             return {'isAuthenticated': False}, 401
+        
+        
+register_parser = reqparse.RequestParser()
+register_parser.add_argument('username', type=str, required=True, help='Username is required')
+register_parser.add_argument('email', type=str, required=True, help='Email is required')
+register_parser.add_argument('password', type=str, required=True, help='Password is required')
 
 @api.route('/register')
 class Register(Resource):
+    @api.expect(register_parser)
     def post(self):
-        """
-        Register User.
-        
-        This endpoint registers a new user with the provided username, email, and password.
-        """
-        data = request.json
-        username = data.get('username')
-        email = data.get('email')
-        password = data.get('password')
+        # Parse the incoming request
+        args = register_parser.parse_args()
 
+        # Extract the username, email, and password from the parsed request
+        username = args.get('username')
+        email = args.get('email')
+        password = args.get('password')
+
+        # Check if the user already exists
         existing_user = User.query.filter_by(username=username).first()
 
         if existing_user:
             return {'message': 'Username already exists'}, 400
 
+        # Create a new user
         new_user = User(username=username, email=email, password=password)
         db.session.add(new_user)
         db.session.commit()
         return {'message': 'Registration successful'}, 201
     
+refresh_parser = reqparse.RequestParser()
+refresh_parser.add_argument('refresh_token', type=str, required=True, help='Refresh token is required')
+
 @app.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def refresh():
+    args = refresh_parser.parse_args()
+    refresh_token = args['refresh_token']
+
     # Get the current user's ID
     current_user_id = get_jwt_identity()
 
@@ -1342,7 +1403,6 @@ def refresh():
 
     # Create a new access token
     new_access_token = create_access_token(identity=current_user_id)
-    refresh_token = token_in_db.token
 
     # Return the new access token and the refresh token
     return {"access_token": new_access_token, "refresh_token": refresh_token}, 200
@@ -1393,103 +1453,110 @@ def check_token():
     
 
 # Route for refreshing Spotify token
-@app.route('/spotify/refresh', methods=['POST'])
-def spotify_refresh():
-    access_token = refresh_spotify_token()
-    return jsonify({'message': 'Access token refreshed successfully', 'spotify_access_token' : access_token}), 200
+spotify_ns = api.namespace('spotify', description='Spotify related operations')
 
-@app.route('/profile', methods=['GET'])
-@cache.cached(timeout=3600) 
-@jwt_required()
-def get_user_profile():
-    current_user_id = get_jwt_identity()
-    user = db.session.get(User, current_user_id)
-    if not user:
-        return jsonify({'message': 'User not found'}), 404
-    profile_data = {
-        'id': current_user_id,
-        'username': user.username,
-        'role' : user.role,
-    }
-    return jsonify({"profile" : profile_data}), 200
+spotify_refresh_parser = reqparse.RequestParser()
+spotify_refresh_parser.add_argument('refresh_token', type=str, required=True, help='Refresh token is required')
 
-
-@app.route('/logout')
-@jwt_required()
-def logout():
-    # Create the response object
-    response = make_response(jsonify({'message': 'User logged out'}))
-    unset_jwt_cookies(response)
-    return response, 200
-
-class EmailResource(Resource):
+@spotify_ns.route('/refresh')
+class SpotifyRefresh(Resource):
+    @spotify_ns.expect(spotify_refresh_parser)
     def post(self):
-        """
-        Send Email.
-        
-        This endpoint sends an email using SMTP with the provided parameters.
-        """
-        data = request.json
-        sender_email = data.get('sender_email')
-        sender_password = data.get('sender_password')
-        recipient_email = data.get('recipient_email')
-        subject = data.get('subject')
-        template_name = data.get('template_name')
-        template_vars = data.get('template_vars')
+        args = spotify_refresh_parser.parse_args()
+        refresh_token = args['refresh_token']
 
-        try:
-            send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars)
-            return {'message': 'Email sent successfully'}, 200
-        except Exception as e:
-            return {'error': str(e)}, 500
+        access_token, expires_at = refresh_spotify_token()
 
-    def send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars):
-        try:
-            smtp_server = 'smtp.gmail.com'
-            smtp_port = 587
+        if expires_at is None:
+            # Handle the case where 'expires_at' is not in token_info
+            # For example, you might return an error message
+            return {'error': 'expires_at not found in token_info'}, 400
 
-            server = smtplib.SMTP(smtp_server, smtp_port)
-            server.starttls()
-            server.login(sender_email, sender_password)
+        return {'message': 'Access token refreshed successfully', 'spotify_token' : access_token, 'spotify_expires_at' : expires_at}, 200
+    
+profile_put_parser = reqparse.RequestParser()
+profile_put_parser.add_argument('username', type=str, required=False, help='Username')
+profile_put_parser.add_argument('email', type=str, required=False, help='Email')    
+    
+@api.route('/profile')
+class UserProfile(Resource):
+    @api.doc(security='Bearer')
+    @jwt_required()
+    def get(self):
+        current_user_id = get_jwt_identity()
+        user = db.session.get(User, current_user_id)
+        if not user:
+            return {'message': 'User not found'}, 404
+        profile_data = {
+            'id': current_user_id,
+            'username': user.username,
+            'role' : user.role,
+        }
+        return {"profile" : profile_data}, 200
+    
+    @api.doc(security='Bearer')
+    @jwt_required()
+    def put(self):
+        args = profile_put_parser.parse_args()
+        username = args['username']
+        email = args['email']
 
-            msg = MIMEMultipart()
-            msg['From'] = 'Pyppo The Final'
-            msg['To'] = recipient_email
-            msg['Subject'] = subject
+        current_user_id = get_jwt_identity()
+        current_user = User.query.get(current_user_id)
+        if not current_user:
+            return {'message': 'User not found'}, 404
 
-            html_content = render_template(template_name, **template_vars)
+        if username:
+            user_with_same_username = User.query.filter_by(username=username).first()
+            if user_with_same_username and user_with_same_username.id != current_user_id:
+                return {'exists_name': True}, 200
 
-            msg.attach(MIMEText(html_content, 'html'))
+        if email:
+            user_with_same_email = User.query.filter_by(email=email).first()
+            if user_with_same_email and user_with_same_email.id != current_user_id:
+                return {'exists_email': True}, 200
 
-            server.sendmail(sender_email, recipient_email, msg.as_string())
-            server.quit()
+        if username:
+            current_user.username = username
+        if email:
+            current_user.email = email
 
-        except smtplib.SMTPAuthenticationError as e:
-            raise Exception("SMTP Authentication Error: Check if username and password are correct.")
-        except Exception as e:
-            raise Exception("An error occurred: Please check your SMTP server settings and try again.")
+        db.session.commit()
 
-@api.route('/email')
-class EmailAPI(Resource):
+        return {'message': 'Profile updated successfully'}, 200
+
+@api.route('/logout')
+class UserLogout(Resource):
+    @api.doc(security='Bearer Auth')
+    @jwt_required()
     def post(self):
-        """
-        Send Email.
-        
-        This endpoint sends an email using SMTP with the provided parameters.
-        """
-        data = request.json
-        sender_email = data.get('sender_email')
-        sender_password = data.get('sender_password')
-        recipient_email = data.get('recipient_email')
-        subject = data.get('subject')
-        template_name = data.get('template_name')
-        template_vars = data.get('template_vars')
+        # Create the response object
+        response = make_response({'message': 'User logged out'})
+        unset_jwt_cookies(response)
+        return {'message': 'User logged out'}, 200
 
-        try:
-            send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars)
-            return {'message': 'Email sent successfully'}, 200
-        except Exception as e:
-            return {'error': str(e)}, 500
+
+# @api.route('/email')
+# class EmailAPI(Resource):
+#     def post(self):
+#         """
+#         Send Email.
+        
+#         This endpoint sends an email using SMTP with the provided parameters.
+#         """
+#         data = request.json
+#         sender_email = data.get('sender_email')
+#         sender_password = data.get('sender_password')
+#         recipient_email = data.get('recipient_email')
+#         subject = data.get('subject')
+#         template_name = data.get('template_name')
+#         template_vars = data.get('template_vars')
+
+#         try:
+#             send_email(sender_email, sender_password, recipient_email, subject, template_name, **template_vars)
+#             return {'message': 'Email sent successfully'}, 200
+#         except Exception as e:
+#             return {'error': str(e)}, 500
         
 def upload_image_to_cloudinary(image_url):
     try:
@@ -1554,27 +1621,6 @@ def upgrade_to_premium(user_id):
     db.session.commit()
     return jsonify({'message': 'User upgraded to premium successfully'}), 200
 
-from sqlalchemy import exc
-
-class HealthCheck(Resource):
-    def get(self):
-        """
-        Health Check
-        
-        Check the health status of the application.
-        """
-        try:
-            # Try to query the database
-            db.session.query("1").from_statement("SELECT 1").all()
-            return {"status": "OK"}, 200
-        except exc.SQLAlchemyError as e:
-            # If an error occurred with the database, return a 500 status code and the error message
-            return {"status": "Error", "message": str(e)}, 500
-        except Exception as e:
-            # For other exceptions, return a 500 status code and the error message
-            return {"status": "Error", "message": str(e)}, 500
-
-api.add_resource(HealthCheck, '/healthcheck')
 
 if __name__ == "__main__":
     app.run(debug=True, port=5003)
