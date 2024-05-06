@@ -126,6 +126,8 @@ app.config['JWT_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['JWT_COOKIE_CSRF_PROTECT'] = False
 
+app.config['RATELIMIT_STORAGE_URL'] = 'redis://:Delta1006@192.0.2.0:6379/0'
+
 
 # End configuring
 
@@ -143,7 +145,7 @@ migrate = Migrate(app, db)
 mail = Mail(app)
 # End init Mail
 
-limiter = Limiter(key_func=get_remote_address, storage_uri="redis://:Delta1006@localhost:6379/0")
+limiter = Limiter(key_func=get_remote_address)
 limiter.init_app(app)
 
 
@@ -1456,8 +1458,9 @@ def paypal_capture():
     else:
         if user_email:
             send_email(user_email)
-        send_email(payment_email)
-        send_email(user_email)
+        else:
+            send_email(payment_email)
+            send_email(user_email)
 
     return jsonify({"payload" : data}), 200
 
@@ -1532,6 +1535,7 @@ def get_access_token(code):
 
 # ----------------------- LOGIN - REGISTER ------------------------ #
 @app.route('/login', methods=['POST'])
+@limiter.limit("10/minute", error_message='Too many requests. Please try again later.')
 def login():
     username = request.json.get('username')
     password = request.json.get('password')
@@ -1576,6 +1580,7 @@ def check_auth():
 
 
 @app.route('/register', methods=['POST'])
+@limiter.limit("4/minute", error_message='Too many requests. Please try again later.')
 def register():
     
     data = request.json
