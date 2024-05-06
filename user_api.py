@@ -185,6 +185,10 @@ cloudinary.config(
 )
 api = Api(app, doc='/api', version='1.0', title='Pyppo Web Music API', description='', authorizations=authorizations)
 
+@app.route('/')
+def index():
+    return jsonify({"status": "success", "message": "Welcome to Pyppo Web Music API"}), 200
+
 # ------------------- NAMESPACE -----------------------------
 personal_ns = api.namespace('personal', description='Personal playlists operations')
 authorize_ns = api.namespace('authorize', description='Authorization operations')
